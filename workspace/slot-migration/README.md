@@ -12,7 +12,7 @@ slotmig/
   proof.py        切换证明的生成与独立验证
   reconcile.py    位点对账报告 + HTML 页面
   api.py          HTTP API（仅标准库）
-tests/            24 个端到端与边界场景测试
+tests/            42 个端到端与边界场景测试
 demo.py           全流程演示（写入线程 + 消费者线程并发）
 ```
 
@@ -20,8 +20,8 @@ demo.py           全流程演示（写入线程 + 消费者线程并发）
 
 ```bash
 cd slot-migration
-python3 -m unittest discover -s tests   # 运行测试（24 个）
-python3 demo.py                          # 端到端演示
+python3 -m unittest discover -s tests   # 运行测试（42 个）
+python3 demo.py                          # 端到端演示（含观察期撤回）
 python3 demo.py --serve                  # 演示后保持 API 运行（打开对账页面）
 python3 -m slotmig.api --port 8080       # 只启动 API 服务（含演示数据）
 ```
@@ -30,9 +30,10 @@ python3 -m slotmig.api --port 8080       # 只启动 API 服务（含演示数�
 
 ```
 DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify──▶ VERIFIED ──cutover──▶ COMPLETED
-                     ▲                 │                     │
-                     │                 └── 失败 ──▶ FAILED ──┤
-                     └────────── retry（attempt+1）──────────┘
+                     ▲                 │                     │                   │
+                     │                 └── 失败 ──▶ FAILED ──┤                 withdraw
+                     └────────── retry（attempt+1）──────────┘                 ▼
+                                                                          WITHDRAWN（终态）
 任意非终态 ──abort──▶ ABORTED（终态）
 ```
 
@@ -48,7 +49,40 @@ DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify�
 * **retry** 失败计划以新 attempt 重试（重建快照、自动清空目标表、重传增量）；
   模式变更导致的失败**不可重试**，必须新建计划。
 * **release-source** 切换后源表保持围栏（防双写脑裂）；运维确认写流量已切到
-  目标后调用，解除围栏。
+  目标后调用，解除围栏。解除保护后交接不可撤回。
+* **withdraw** 交接成功后进入可配置观察期（默认 5 分钟，建计划时可用
+  `observation_window_ms` 按计划覆盖）。观察期内，若接管方尚未确认任何新记录、
+  原服务仍处于围栏保护且未过截止时间，操作员可撤回交接（详见下节）。
+
+## 观察期撤回（withdraw）
+
+交接（cutover）成功的**同一事务**内，除原有的 epoch+1、换槽、落切换证明外，
+还会记录两个游标和观察期元数据：
+
+* `takeover_cursor`（目标 LSN q）——**接管方开始服务时的确认游标**；
+* `takeover_source_cursor`（源 LSN p_old）——撤回时要恢复的原服务游标；
+* 观察期窗口长度与 `observation_deadline`。
+
+观察期内满足全部条件才可撤回：① 未过截止时间；② 接管方水位仍等于开服游标
+（水位 > q 即视为已确认新记录；恰好在 q 上的重复提交是幂等空操作，不算数）；
+③ 原服务仍受保护（未调用 release-source 且源围栏仍在）。
+
+撤回在**同一个 SQLite 事务**内完成：复核消费者组 epoch 与活跃槽、epoch **再 +1**
+（围栏掉所有接管方消费者）、活跃槽切回原槽、水位恢复为 p_old（**保留已有游标，
+绝不重置**）、计划置 `WITHDRAWN`、写入可验真的**撤回凭证**与 `HANDOFF_REVOKED`
+事件。事务提交后恢复原槽 ACTIVE、解除源围栏（写入恢复）、退役接管槽。事务中任何
+一步失败整体回滚，运行状态不变。
+
+* **幂等**：撤回成功后相同请求再次到达，只返回既有凭证，不产生第二次撤回。
+* **拒绝零副作用**：接管方已确认新记录（`TAKEOVER_CONFIRMED`）、原服务已解除
+  保护（`SOURCE_PROTECTION_RELEASED`）、观察期结束（`OBSERVATION_EXPIRED`）、
+  交接尚未发生（`NO_COMPLETED_HANDOFF`）时返回对应原因码与全部阻止条件，所有
+  运行状态（组归属/epoch/水位、槽状态、围栏、计划状态）保持不变。
+* **撤回凭证**：结构见下，`POST /revocations/verify` 执行 12 项检查（哈希完整性、
+  epoch 二次步进、游标保留、确在观察期内、计划已撤回、组已切回、库内哈希一致、
+  与切换证明的引用一致等）。
+* 撤回是终态：不能再 release-source；原槽/组已释放，可新建计划重新迁移
+  （目标端残留的副本数据需运维先清空，与首次装载拒绝非空目标一致）。
 
 ## 原子切换协议（cutover）
 
@@ -73,6 +107,7 @@ DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify�
 | 不重复推进 | 目标端按 (plan, 源LSN) 幂等应用；水位只单调前进，重复提交为幂等空操作 |
 | 不存在两个有效消费水位 | 消费者组单行记录（唯一活跃槽）；epoch 围栏；切换为单事务 |
 | 旧消费者迟到确认 | 旧 epoch → `STALE_EPOCH`；旧槽 → `SLOT_NOT_ACTIVE`；集群层 RETIRED 槽拒读 |
+| 观察期撤回 | 单事务切回 + epoch 再+1 + 游标恢复；已确认新记录/已解保护/已过期均拒绝且零副作用；重复请求幂等返回凭证 |
 | 模式变更 | 计划冻结各表模式版本；每个阶段入口 + 流内 SCHEMA 事件双重检测 → 计划失败、消费者不受影响、禁止重试（须新建计划） |
 | 迁移重试 | 全部构件按 attempt 隔离；重试自动清空目标重建；SCHEMA_CHANGED 拒绝重试 |
 
@@ -101,6 +136,31 @@ DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify�
 已切换、库内证明哈希一致、LSN 映射重算一致。篡改任何字段都会使
 `hash_integrity` 失败。
 
+## 撤回凭证（revocation）
+
+观察期内撤回成功即落库一份与切换证明同构、互相引用的防篡改凭证：
+
+```json
+{
+  "kind": "handoff_revocation",
+  "revocation_id": "revoke_…", "plan_id": "plan_…", "attempt": 1,
+  "cutover_ref": { "proof_id": "proof_…", "proof_hash": "…", "cutover_lsn": 339 },
+  "observation": { "window_ms": 300000, "deadline": "…",
+                   "observed_at": "…", "revoked_at": "…" },
+  "takeover":  { "cluster": "target", "slot": "app_slot_replica", "epoch": 2,
+                 "confirm_cursor_target_lsn": 85, "new_records_confirmed": false },
+  "restoration": { "cluster": "source", "slot": "app_slot", "epoch": 3,
+                   "watermark_source_lsn": 336 },
+  "cursor_retention": { "takeover_cursor_retained": 85,
+                        "restored_source_cursor": 336 },
+  "timeline_digest": "…",
+  "revocation_hash": "sha256(除自身外的全部字段)"
+}
+```
+
+`POST /revocations/verify`（或 `slotmig.verify_revocation(rev, store)`）
+独立验真；篡改任何字段都会使 `hash_integrity` 失败。
+
 ## 位点对账页面
 
 `GET /plans/{id}/reconcile.html`（5 秒自动刷新），JSON 版本在
@@ -110,8 +170,13 @@ DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify�
 * 八个关键位点：冻结位点、快照位点、源当前位点、已扫描位点、目标已应用
   位点、落后事件数、校验标记位点、切换位点；
 * 各表行数与校验和（即时值，仅供参考）+ 校验标记处的权威比对结论；
-* 消费者组：活跃槽、epoch、水位、两侧槽状态；
-* 切换证明哈希与链接、完整事件时间线。
+* 消费者组：活跃槽、epoch、两个接管游标、当前水位、两侧槽状态；
+* **交接观察期与撤回**：阶段（观察中/已撤回/未开始）、撤回资格、截止时间与
+  剩余时间、接管方是否已确认新记录、原服务是否仍受保护、逐条阻止条件
+  （`OBSERVATION_EXPIRED` / `TAKEOVER_CONFIRMED` / `SOURCE_PROTECTION_RELEASED`）、
+  撤回凭证 ID/哈希与链接；
+* 切换证明哈希与链接、完整事件时间线（含 `CUTOVER_EXECUTED` 与
+  `HANDOFF_REVOKED`）。
 
 ## API 一览
 
@@ -122,18 +187,25 @@ DRAFT ──freeze──▶ FROZEN ──start──▶ STREAMING ──verify�
 | POST | `/plans/{id}/start` | 一致快照 + 打开增量流 |
 | POST | `/plans/{id}/catch-up` | 追增量（幂等） |
 | POST | `/plans/{id}/verify` | 零停机校验 |
-| POST | `/plans/{id}/cutover` | 原子切换（需 VERIFIED） |
+| POST | `/plans/{id}/cutover` | 原子切换（需 VERIFIED，开启观察期） |
+| POST | `/plans/{id}/withdraw` | 观察期内撤回交接（幂等；不符条件返回原因码） |
+| GET | `/plans/{id}/withdrawal` | 撤回资格 / 截止时间 / 阻止条件 |
+| GET | `/plans/{id}/revocation` | 撤回凭证 JSON |
 | POST | `/plans/{id}/retry` `/abort` `/release-source` | 重试 / 中止 / 释放源围栏 |
 | GET | `/plans/{id}` `/plans` | 计划详情 / 列表 |
 | GET | `/plans/{id}/reconcile[.html]` | 位点对账（JSON / 页面） |
 | GET | `/plans/{id}/proof` | 切换证明 |
-| POST | `/proofs/verify` | 独立验证证明 |
+| POST | `/proofs/verify` | 独立验证切换证明 |
+| POST | `/revocations/verify` | 独立验证撤回凭证 |
 | POST | `/groups/{g}/commit` | 消费者水位提交（epoch 围栏） |
 | POST | `/clusters/{c}/write` `/delete` `/schema-change` | 集群模拟驱动 |
 | GET | `/clusters/{c}/slots/{s}/read?after=N` | 槽消费读取（RETIRED 拒读） |
 
 错误统一为 `{"error": 稳定错误码, "message": …}`，如 `STALE_EPOCH`、
 `WRITES_FENCED`、`SCHEMA_CHANGED`、`VERIFY_MISMATCH`、`TARGET_NOT_EMPTY`。
+撤回相关：`TAKEOVER_CONFIRMED`、`SOURCE_PROTECTION_RELEASED`、
+`OBSERVATION_EXPIRED`、`NO_COMPLETED_HANDOFF`（拒绝时 `details` 附全部
+阻止条件与截止时间）。
 
 ## 设计说明与权衡
 

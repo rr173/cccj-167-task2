@@ -12,7 +12,16 @@ import threading
 import time
 import unittest
 
-from slotmig import Cluster, MigrationController, MigrationError, Store, verify_proof
+from slotmig import (
+    Cluster,
+    MigrationController,
+    MigrationError,
+    Store,
+    verify_proof,
+    verify_revocation,
+)
+from slotmig.reconcile import render_html
+from datetime import datetime, timedelta, timezone
 
 
 class Base(unittest.TestCase):
@@ -32,13 +41,14 @@ class Base(unittest.TestCase):
         self.store.close()
 
     # -- helpers ------------------------------------------------------
-    def make_plan(self, tables=("orders",), group="analytics"):
-        plan = self.ctl.create_plan({
+    def make_plan(self, tables=("orders",), group="analytics", ctl=None):
+        ctl = ctl or self.ctl
+        plan = ctl.create_plan({
             "source_cluster": "source", "source_slot": "app_slot",
             "target_cluster": "target", "target_slot": "app_slot_replica",
             "tables": list(tables), "consumer_group": group,
         })
-        self.ctl.freeze(plan["plan_id"])
+        ctl.freeze(plan["plan_id"])
         return plan["plan_id"]
 
     def run_to_verified(self, pid):
@@ -458,6 +468,439 @@ class PlanLifecycle(Base):
         self.assertEqual(positions["lag_events"], 0)
         for t in report["tables"]:
             self.assertTrue(t["equal_now"])
+
+
+class HandoffWithdrawal(Base):
+    """Observation window + operator withdrawal of a completed handoff."""
+
+    def _clock_ctl(self, window_ms):
+        """A second controller over the same clusters/store with a controllable
+        clock and a short observation window."""
+        t = [datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)]
+
+        def clock():
+            return t[0]
+
+        def advance(seconds):
+            t[0] += timedelta(seconds=seconds)
+
+        ctl = MigrationController(
+            {"source": self.source, "target": self.target}, self.store,
+            observation_window_ms=window_ms, clock=clock)
+        return ctl, advance
+
+    def test_takeover_cursors_saved_at_cutover(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsn = self.source.write("orders", "k0", {"v": 0})
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot", lsn=lsn, epoch=1)
+        self.ctl.verify(pid)
+        proof = self.ctl.cutover(pid)
+        q = proof["handoff"]["new"]["watermark_target_lsn"]
+
+        plan = self.ctl.get_plan(pid)
+        self.assertEqual(plan["state"], "COMPLETED")
+        obs = plan["observation"]
+        self.assertIsNotNone(obs["deadline"])
+        self.assertEqual(obs["takeover_source_cursor"], lsn)
+        self.assertEqual(obs["takeover_cursor"], q)
+        self.assertEqual(obs["source_released_at"], None)
+
+    def test_withdraw_restores_ownership_epoch_and_cursor_one_credential(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsn = self.source.write("orders", "k0", {"v": 0})
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot", lsn=lsn, epoch=1)
+        self.ctl.verify(pid)
+        proof = self.ctl.cutover(pid)
+        q = proof["handoff"]["new"]["watermark_target_lsn"]
+        self.assertEqual(self.ctl.get_group("analytics")["epoch"], 2)
+
+        rev = self.ctl.withdraw_handoff(pid)
+
+        # group restored: original slot, epoch bumped AGAIN, old cursor kept
+        g = self.ctl.get_group("analytics")
+        self.assertEqual((g["cluster"], g["slot"]), ("source", "app_slot"))
+        self.assertEqual(g["epoch"], 3)
+        self.assertEqual(g["watermark"], lsn)          # cursor retained
+
+        plan = self.ctl.get_plan(pid)
+        self.assertEqual(plan["state"], "WITHDRAWN")
+        self.assertEqual(plan["observation"]["revocation_id"],
+                         rev["revocation_id"])
+
+        # cluster-level: source slot reads again & writes flow, target retired
+        self.assertEqual(self.source.get_slot("app_slot")["status"], "ACTIVE")
+        self.assertEqual(self.target.get_slot("app_slot_replica")["status"],
+                         "RETIRED")
+        self.source.write("orders", "after-withdraw", {"v": 9})
+        with self.assertRaises(MigrationError) as ctx:
+            self.target.read_slot("app_slot_replica", q)
+        self.assertEqual(ctx.exception.code, "SLOT_NOT_ACTIVE")
+
+        # late takeover-side ack is fenced off at epoch 2
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.commit("analytics", "target", "app_slot_replica",
+                            lsn=q + 1, epoch=2)
+        self.assertEqual(ctx.exception.code, "STALE_EPOCH")
+
+        # the credential independently verifies
+        verdict = verify_revocation(rev, self.store)
+        self.assertTrue(verdict["valid"], verdict)
+
+        # original consumer resumes on the restored slot without gap/reset
+        r = self.ctl.commit("analytics", "source", "app_slot",
+                            lsn=lsn + 2, epoch=3)
+        self.assertTrue(r["advanced"])
+
+    def test_withdraw_is_idempotent_returns_existing_credential(self):
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        rev1 = self.ctl.withdraw_handoff(pid)
+        rev2 = self.ctl.withdraw_handoff(pid)   # same request again
+        self.assertEqual(rev1["revocation_id"], rev2["revocation_id"])
+        self.assertEqual(rev1["revocation_hash"], rev2["revocation_hash"])
+        self.assertEqual(self.ctl.get_group("analytics")["epoch"], 3)
+        kinds = [e["kind"] for e in self.store.get_events(pid)]
+        self.assertEqual(kinds.count("HANDOFF_REVOKED"), 1)
+
+    def test_blocked_after_takeover_confirms_new_record_state_untouched(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsns = [self.source.write("orders", f"k{i}", {"v": i})
+                for i in range(6)]
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot",
+                        lsn=lsns[2], epoch=1)
+        self.ctl.verify(pid)
+        proof = self.ctl.cutover(pid)
+        q = proof["handoff"]["new"]["watermark_target_lsn"]
+
+        # takeover consumer confirms one NEW target record
+        r = self.ctl.commit("analytics", "target", "app_slot_replica",
+                            lsn=q + 1, epoch=2)
+        self.assertTrue(r["advanced"])
+        target_slot_cursor = self.target.get_slot(
+            "app_slot_replica")["confirmed_lsn"]
+
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.withdraw_handoff(pid)
+        self.assertEqual(ctx.exception.code, "TAKEOVER_CONFIRMED")
+        codes = {b["code"] for b in ctx.exception.details["blocking_conditions"]}
+        self.assertIn("TAKEOVER_CONFIRMED", codes)
+
+        # everything stays as it was
+        g = self.ctl.get_group("analytics")
+        self.assertEqual((g["cluster"], g["slot"]),
+                         ("target", "app_slot_replica"))
+        self.assertEqual(g["epoch"], 2)
+        self.assertEqual(self.ctl.get_plan(pid)["state"], "COMPLETED")
+        self.assertEqual(self.target.get_slot("app_slot_replica")["status"],
+                         "ACTIVE")
+        self.assertEqual(
+            self.target.get_slot("app_slot_replica")["confirmed_lsn"],
+            target_slot_cursor)
+        self.assertIsNone(self.store.get_revocation_for_plan(pid))
+
+    def test_duplicate_ack_at_cursor_does_not_block_withdraw(self):
+        # an idempotent commit exactly at the saved takeover cursor is not a
+        # "new confirmation" — withdrawal stays available
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        q = self.ctl.get_group("analytics")["watermark"]
+        dup = self.ctl.commit("analytics", "target", "app_slot_replica",
+                              lsn=q, epoch=2)
+        self.assertTrue(dup["duplicate"])
+        self.assertTrue(self.ctl.withdrawal_status(pid)["eligible"])
+        rev = self.ctl.withdraw_handoff(pid)
+        self.assertIn("revocation_hash", rev)
+
+    def test_blocked_after_source_released_state_untouched(self):
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        self.ctl.release_source(pid)
+        self.source.write("orders", "new-write", {})
+
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.withdraw_handoff(pid)
+        self.assertEqual(ctx.exception.code, "SOURCE_PROTECTION_RELEASED")
+
+        g = self.ctl.get_group("analytics")
+        self.assertEqual((g["cluster"], g["slot"]),
+                         ("target", "app_slot_replica"))
+        self.assertEqual(g["epoch"], 2)
+        self.assertEqual(self.ctl.get_plan(pid)["state"], "COMPLETED")
+        self.assertIsNone(self.store.get_revocation_for_plan(pid))
+
+        # releasing twice is idempotent and cannot re-arm withdrawal
+        self.ctl.release_source(pid)
+        with self.assertRaises(MigrationError):
+            self.ctl.withdraw_handoff(pid)
+
+    def test_blocked_after_observation_window_expires(self):
+        ctl, advance = self._clock_ctl(window_ms=10_000)
+        pid = self.make_plan(ctl=ctl)
+        ctl.start(pid)
+        ctl.catch_up(pid)
+        ctl.verify(pid)
+        ctl.cutover(pid)
+
+        st = ctl.withdrawal_status(pid)
+        self.assertTrue(st["eligible"])
+        self.assertEqual(st["phase"], "OBSERVATION")
+        self.assertGreater(st["remaining_ms"], 9_000)
+
+        advance(11)  # window (10s) is over
+        st = ctl.withdrawal_status(pid)
+        self.assertFalse(st["eligible"])
+        self.assertTrue(st["expired"])
+        self.assertEqual(st["blocking_conditions"][0]["code"],
+                         "OBSERVATION_EXPIRED")
+        with self.assertRaises(MigrationError) as ctx:
+            ctl.withdraw_handoff(pid)
+        self.assertEqual(ctx.exception.code, "OBSERVATION_EXPIRED")
+        # runtime untouched
+        self.assertEqual(ctl.get_group("analytics")["epoch"], 2)
+        self.assertEqual(ctl.get_plan(pid)["state"], "COMPLETED")
+        # source still fenced even though the window elapsed
+        self.assertTrue(self.source.is_fenced("orders"))
+
+    def test_withdraw_just_inside_window_succeeds(self):
+        ctl, advance = self._clock_ctl(window_ms=10_000)
+        pid = self.make_plan(ctl=ctl)
+        ctl.start(pid)
+        ctl.catch_up(pid)
+        ctl.verify(pid)
+        ctl.cutover(pid)
+        advance(10)  # exactly at the deadline — still open (<)
+        rev = ctl.withdraw_handoff(pid)
+        self.assertIn("revocation_hash", rev)
+        self.assertEqual(ctl.get_plan(pid)["state"], "WITHDRAWN")
+
+    def test_withdraw_before_cutover_rejected(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.withdraw_handoff(pid)
+        self.assertEqual(ctx.exception.code, "NO_COMPLETED_HANDOFF")
+
+    def test_credential_tampering_detected(self):
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        rev = self.ctl.withdraw_handoff(pid)
+        self.assertTrue(verify_revocation(rev, self.store)["valid"])
+        tampered = dict(rev)
+        tampered["restoration"] = dict(rev["restoration"], epoch=99)
+        verdict = verify_revocation(tampered, self.store)
+        self.assertFalse(verdict["valid"])
+        self.assertIn("hash_integrity",
+                      {c["check"] for c in verdict["checks"] if not c["ok"]})
+
+    def test_takeover_slot_cursor_retained_after_withdraw(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsns = [self.source.write("orders", f"k{i}", {"v": i})
+                for i in range(5)]
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot",
+                        lsn=lsns[1], epoch=1)
+        self.ctl.verify(pid)
+        proof = self.ctl.cutover(pid)
+        q = proof["handoff"]["new"]["watermark_target_lsn"]
+        self.assertEqual(
+            self.target.get_slot("app_slot_replica")["confirmed_lsn"], q)
+        self.ctl.withdraw_handoff(pid)
+        # takeover cursor preserved on the retired slot (not reset)
+        self.assertEqual(
+            self.target.get_slot("app_slot_replica")["confirmed_lsn"], q)
+
+    def test_withdraw_then_new_plan_possible_and_consumer_continuous(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsn = self.source.write("orders", "k0", {"v": 0})
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot", lsn=lsn, epoch=1)
+        self.ctl.verify(pid)
+        self.ctl.cutover(pid)
+        self.ctl.withdraw_handoff(pid)
+
+        # a fresh plan over the now-free slot/group is allowed; first the
+        # operator discards the (never-confirmed) replica state, as after a
+        # failed cutover
+        self.target._tables["orders"] = {}
+        self.target._running["orders"] = 0
+        pid2 = self.ctl.create_plan({
+            "source_cluster": "source", "source_slot": "app_slot",
+            "target_cluster": "target", "target_slot": "app_slot_replica2",
+            "tables": ["orders"], "consumer_group": "analytics"})["plan_id"]
+        self.ctl.freeze(pid2)
+        self.ctl.start(pid2)
+        self.ctl.catch_up(pid2)
+        self.ctl.verify(pid2)
+        p2 = self.ctl.cutover(pid2)
+        self.assertEqual(p2["attempt"], 1)
+        g = self.ctl.get_group("analytics")
+        self.assertEqual((g["cluster"], g["slot"]),
+                         ("target", "app_slot_replica2"))
+        self.assertEqual(g["epoch"], 4)   # 1 → cutover → 2 → withdraw → 3 → 4
+
+    def test_reconcile_shows_eligibility_deadline_blockers_and_credential(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsn = self.source.write("orders", "k0", {"v": 0})
+        self.ctl.catch_up(pid)
+        self.ctl.commit("analytics", "source", "app_slot", lsn=lsn, epoch=1)
+        self.ctl.verify(pid)
+        self.ctl.cutover(pid)
+
+        rep = self.ctl.reconcile(pid)
+        w = rep["withdrawal"]
+        self.assertEqual(w["phase"], "OBSERVATION")
+        self.assertTrue(w["eligible"])
+        self.assertIsNotNone(w["deadline"])
+        self.assertEqual(w["blocking_conditions"], [])
+        self.assertFalse(w["takeover_confirmed_new_records"])
+        self.assertTrue(w["source_protected"])
+
+        page = render_html(self.ctl.reconcile(pid))
+        self.assertIn("交接观察期与撤回", page)
+        self.assertIn("可撤回", page)
+        self.assertIn("截止时间", page)
+        self.assertIn("接管方开服确认游标", page)
+
+        # after a takeover confirmation the report lists the blocker
+        q = w["takeover_cursor"]
+        self.ctl.commit("analytics", "target", "app_slot_replica",
+                        lsn=q + 1, epoch=2)
+        rep = self.ctl.reconcile(pid)
+        self.assertFalse(rep["withdrawal"]["eligible"])
+        self.assertEqual(rep["withdrawal"]["blocking_conditions"][0]["code"],
+                         "TAKEOVER_CONFIRMED")
+        page = render_html(self.ctl.reconcile(pid))
+        self.assertIn("接管方已确认新记录", page)
+        self.assertIn("不可撤回", page)
+
+    def test_reconcile_after_withdraw_shows_credential_and_event(self):
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        rev = self.ctl.withdraw_handoff(pid)
+        rep = self.ctl.reconcile(pid)
+        self.assertEqual(rep["withdrawal"]["phase"], "WITHDRAWN")
+        self.assertEqual(rep["withdrawal"]["revocation"]["revocation_id"],
+                         rev["revocation_id"])
+        kinds = [e["kind"] for e in rep["timeline"]]
+        self.assertIn("HANDOFF_REVOKED", kinds)
+        page = render_html(self.ctl.reconcile(pid))
+        self.assertIn("交接已撤回", page)
+        self.assertIn(rev["revocation_hash"], page)
+
+    def test_configurable_window_per_plan(self):
+        pid = self.ctl.create_plan({
+            "source_cluster": "source", "source_slot": "app_slot",
+            "target_cluster": "target", "target_slot": "app_slot_replica",
+            "tables": ["orders"], "consumer_group": "analytics",
+            "observation_window_ms": 1234})["plan_id"]
+        self.ctl.freeze(pid)
+        self.ctl.start(pid)
+        self.ctl.verify(pid)
+        self.ctl.cutover(pid)
+        self.assertEqual(self.ctl.get_plan(pid)["observation"]["window_ms"],
+                         1234)
+
+    def test_withdraw_keeps_consuming_after_restore_exact_no_gap(self):
+        pid = self.make_plan()
+        self.ctl.start(pid)
+        lsns = [self.source.write("orders", f"k{i}", {"v": i})
+                for i in range(8)]
+        self.ctl.catch_up(pid)
+        p_old = lsns[3]
+        self.ctl.commit("analytics", "source", "app_slot",
+                        lsn=p_old, epoch=1)
+        self.ctl.verify(pid)
+        proof = self.ctl.cutover(pid)
+        self.assertEqual(proof["handoff"]["new"]["watermark_target_lsn"],
+                         proof["handoff"]["mapping_anchor"]["target_lsn"])
+        self.ctl.withdraw_handoff(pid)
+
+        # source keeps accepting writes; consumer continues from p_old
+        more = [self.source.write("orders", f"m{i}", {"v": i})
+                for i in range(4)]
+        entries = self.source.read_slot("app_slot", after_lsn=p_old)
+        got = [e.lsn for e in entries if e.kind == "row" and e.table == "orders"]
+        self.assertEqual(got, sorted(lsns[4:] + more))  # no gap, no dup
+
+    def test_release_source_refused_after_withdraw(self):
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        self.ctl.withdraw_handoff(pid)
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.release_source(pid)
+        self.assertEqual(ctx.exception.code, "INVALID_STATE")
+
+
+class WithdrawalApi(Base):
+    def test_http_withdraw_flow(self):
+        import json
+        import urllib.request
+        import urllib.error
+        from slotmig.api import create_server
+
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+
+        server = create_server(self.ctl,
+                               {"source": self.source, "target": self.target},
+                               "127.0.0.1", 0)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def call(method, path, payload=None):
+                data = json.dumps(payload).encode() if payload is not None else None
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}", data=data, method=method,
+                    headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        return resp.status, json.loads(resp.read().decode())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode())
+
+            status, st = call("GET", f"/plans/{pid}/withdrawal")
+            self.assertEqual(status, 200)
+            self.assertTrue(st["eligible"])
+            self.assertEqual(st["blocking_conditions"], [])
+
+            status, rev = call("POST", f"/plans/{pid}/withdraw")
+            self.assertEqual(status, 200)
+            self.assertEqual(rev["kind"], "handoff_revocation")
+            rid = rev["revocation_id"]
+
+            # repeat request → same existing result
+            status, rev2 = call("POST", f"/plans/{pid}/withdraw")
+            self.assertEqual(status, 200)
+            self.assertEqual(rev2["revocation_id"], rid)
+
+            # credential fetch + independent verification endpoints
+            status, fetched = call("GET", f"/plans/{pid}/revocation")
+            self.assertEqual(status, 200)
+            self.assertEqual(fetched["revocation_hash"], rev["revocation_hash"])
+            status, verdict = call("POST", "/revocations/verify",
+                                   {"revocation": fetched})
+            self.assertEqual(status, 200)
+            self.assertTrue(verdict["valid"], verdict)
+
+            # reconcile HTML mentions the credential
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/plans/{pid}/reconcile.html")
+            with urllib.request.urlopen(req) as resp:
+                page = resp.read().decode()
+            self.assertIn("交接已撤回", page)
+            self.assertIn(rev["revocation_hash"], page)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class ApiSmoke(Base):

@@ -61,6 +61,12 @@ def _routes(ctl, clusters):
          lambda h, m: _json(ctl.abort(m.group("pid")))),
         ("POST", re.compile(r"^/plans/(?P<pid>[^/]+)/release-source$"),
          lambda h, m: _json(ctl.release_source(m.group("pid")))),
+        ("POST", re.compile(r"^/plans/(?P<pid>[^/]+)/withdraw$"),
+         lambda h, m: _json(ctl.withdraw_handoff(m.group("pid")))),
+        ("GET", re.compile(r"^/plans/(?P<pid>[^/]+)/withdrawal$"),
+         lambda h, m: _json(ctl.withdrawal_status(m.group("pid")))),
+        ("GET", re.compile(r"^/plans/(?P<pid>[^/]+)/revocation$"),
+         lambda h, m: _json(ctl.get_revocation(m.group("pid")))),
         ("GET", re.compile(r"^/plans/(?P<pid>[^/]+)/reconcile$"),
          lambda h, m: _json(ctl.reconcile(m.group("pid")))),
         ("GET", re.compile(r"^/plans/(?P<pid>[^/]+)/reconcile\.html$"),
@@ -70,6 +76,9 @@ def _routes(ctl, clusters):
 
         ("POST", re.compile(r"^/proofs/verify$"),
          lambda h, m: _json(ctl.verify_proof(body(h).get("proof", body(h))))),
+        ("POST", re.compile(r"^/revocations/verify$"),
+         lambda h, m: _json(ctl.verify_revocation(
+             body(h).get("revocation", body(h))))),
 
         ("GET", re.compile(r"^/clusters/(?P<name>[^/]+)$"),
          lambda h, m: _json(clusters[m.group("name")].status()

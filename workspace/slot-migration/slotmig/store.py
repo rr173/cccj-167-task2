@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS plans (
   verify_marker_lsn INTEGER,
   cutover_lsn INTEGER,
   proof_id TEXT,
+  observation_window_ms INTEGER,
+  observation_deadline TEXT,
+  takeover_source_cursor INTEGER,
+  takeover_cursor INTEGER,
+  source_released_at TEXT,
+  revocation_id TEXT,
   error_code TEXT,
   error_message TEXT,
   version INTEGER NOT NULL DEFAULT 0,
@@ -103,16 +109,23 @@ CREATE TABLE IF NOT EXISTS proofs (
   proof_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS revocations (
+  revocation_id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL UNIQUE,
+  revocation_json TEXT NOT NULL,
+  revocation_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 # Plan fields that transition() is allowed to set (SQL-injection whitelist).
 UPDATABLE_FIELDS = {
     "attempt", "schema_versions_json", "frozen_lsn", "snapshot_id",
     "snapshot_lsn", "verify_digest", "verify_marker_lsn", "cutover_lsn",
-    "proof_id", "error_code", "error_message",
+    "proof_id", "error_code", "error_message", "source_released_at",
 }
 
-TERMINAL_STATES = ("COMPLETED", "ABORTED")
+TERMINAL_STATES = ("COMPLETED", "ABORTED", "WITHDRAWN")
 
 
 @dataclass
@@ -134,6 +147,12 @@ class Plan:
     verify_marker_lsn: int | None = None
     cutover_lsn: int | None = None
     proof_id: str | None = None
+    observation_window_ms: int | None = None
+    observation_deadline: str | None = None
+    takeover_source_cursor: int | None = None
+    takeover_cursor: int | None = None
+    source_released_at: str | None = None
+    revocation_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     version: int = 0
@@ -159,6 +178,14 @@ class Plan:
             "verify_marker_lsn": self.verify_marker_lsn,
             "cutover_lsn": self.cutover_lsn,
             "proof_id": self.proof_id,
+            "observation": {
+                "window_ms": self.observation_window_ms,
+                "deadline": self.observation_deadline,
+                "takeover_source_cursor": self.takeover_source_cursor,
+                "takeover_cursor": self.takeover_cursor,
+                "source_released_at": self.source_released_at,
+                "revocation_id": self.revocation_id,
+            },
             "error": {"code": self.error_code, "message": self.error_message}
                      if self.error_code else None,
             "version": self.version,
@@ -193,17 +220,24 @@ class Store:
             frozen_lsn=d["frozen_lsn"], snapshot_id=d["snapshot_id"],
             snapshot_lsn=d["snapshot_lsn"], verify_digest=d["verify_digest"],
             verify_marker_lsn=d["verify_marker_lsn"], cutover_lsn=d["cutover_lsn"],
-            proof_id=d["proof_id"], error_code=d["error_code"],
+            proof_id=d["proof_id"],
+            observation_window_ms=d["observation_window_ms"],
+            observation_deadline=d["observation_deadline"],
+            takeover_source_cursor=d["takeover_source_cursor"],
+            takeover_cursor=d["takeover_cursor"],
+            source_released_at=d["source_released_at"],
+            revocation_id=d["revocation_id"],
+            error_code=d["error_code"],
             error_message=d["error_message"], version=d["version"],
             created_at=d["created_at"], updated_at=d["updated_at"],
         )
 
-    def create_plan(self, spec: dict) -> Plan:
+    def create_plan(self, spec: dict, observation_window_ms: int | None = None) -> Plan:
         plan_id = new_id("plan")
         now = now_iso()
         with self._lock, self.conn:
             clash = self.conn.execute(
-                "SELECT plan_id FROM plans WHERE state NOT IN ('COMPLETED','ABORTED') AND ("
+                "SELECT plan_id FROM plans WHERE state NOT IN ('COMPLETED','ABORTED','WITHDRAWN') AND ("
                 " (source_cluster=? AND source_slot=?) OR"
                 " (target_cluster=? AND target_slot=?) OR"
                 " consumer_group=? )",
@@ -219,10 +253,11 @@ class Store:
             self.conn.execute(
                 "INSERT INTO plans (plan_id, state, attempt, source_cluster, source_slot,"
                 " target_cluster, target_slot, consumer_group, tables_json,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " observation_window_ms, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (plan_id, "DRAFT", 1, spec["source_cluster"], spec["source_slot"],
                  spec["target_cluster"], spec["target_slot"], spec["consumer_group"],
-                 json.dumps(spec["tables"]), now, now))
+                 json.dumps(spec["tables"]), observation_window_ms, now, now))
         return self.get_plan(plan_id)
 
     def get_plan(self, plan_id: str) -> Plan:
@@ -401,7 +436,8 @@ class Store:
     # ----------------------------------------------------------------- cutover
     def execute_cutover(self, *, plan_id: str, attempt: int, group_id: str,
                         expected_epoch: int, new_cluster: str, new_slot: str,
-                        cutover_lsn: int, build_proof_fn) -> dict:
+                        cutover_lsn: int, observation_window_ms: int,
+                        observation_deadline: str, build_proof_fn) -> dict:
         """The atomic switch. In ONE transaction:
 
         1. re-read the group (epoch fence check);
@@ -409,7 +445,9 @@ class Store:
         3. build + persist the cutover proof;
         4. bump the epoch, repoint the group at the new slot, set the
            remapped watermark;
-        5. mark the plan COMPLETED.
+        5. mark the plan COMPLETED and open the observation window, saving
+           the takeover confirmation cursor (target LSN q) and the original
+           service cursor (source LSN p_old) the revocation will restore.
 
         Any failure rolls everything back — the group keeps consuming the old
         slot and the plan stays VERIFIED (the cutover is retryable).
@@ -450,9 +488,12 @@ class Store:
                                          http_status=409)
                 r = cur.execute(
                     "UPDATE plans SET state='COMPLETED', cutover_lsn=?, proof_id=?,"
+                    " observation_window_ms=?, observation_deadline=?,"
+                    " takeover_source_cursor=?, takeover_cursor=?,"
                     " version=version+1, updated_at=?"
                     " WHERE plan_id=? AND state='VERIFIED'",
-                    (cutover_lsn, proof["proof_id"], now_iso(), plan_id))
+                    (cutover_lsn, proof["proof_id"], observation_window_ms,
+                     observation_deadline, p_old, q, now_iso(), plan_id))
                 if r.rowcount != 1:
                     raise MigrationError(CONFLICT, "plan state changed during cutover",
                                          http_status=409)
@@ -464,6 +505,123 @@ class Store:
             except Exception:
                 self.conn.rollback()
                 raise
+
+    def mark_source_released(self, plan_id: str) -> bool:
+        """Idempotently record that the post-cutover source protection was
+        lifted. Returns False if it was already recorded (idempotent call)."""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE plans SET source_released_at=?, version=version+1,"
+                " updated_at=? WHERE plan_id=? AND state='COMPLETED'"
+                " AND source_released_at IS NULL",
+                (now_iso(), now_iso(), plan_id))
+            return cur.rowcount == 1
+
+    # --------------------------------------------------------------- withdraw
+    def execute_revocation(self, *, plan_id: str, group_id: str,
+                           old_cluster: str, old_slot: str,
+                           new_cluster: str, new_slot: str,
+                           takeover_source_cursor: int, takeover_cursor: int,
+                           observation_deadline: str, build_revocation_fn) -> dict:
+        """The atomic handoff withdrawal. In ONE transaction:
+
+        1. re-read the group and assert it still points at the takeover
+           slot/epoch and has NOT advanced the watermark beyond the takeover
+           confirmation cursor (the new owner acknowledged no new record);
+        2. bump the epoch AGAIN (fences off every takeover-side consumer),
+           repoint the group back at the original slot and restore the
+           original watermark — the pre-existing cursor is retained, never
+           reset;
+        3. mark the plan WITHDRAWN, persist the verifiable revocation
+           credential and the HANDOFF_REVOKED event.
+
+        Any failure rolls everything back: the group stays on the takeover
+        slot and the plan stays COMPLETED.
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                g = cur.execute("SELECT * FROM groups WHERE group_id=?",
+                                (group_id,)).fetchone()
+                if g is None:
+                    raise MigrationError(NOT_FOUND, f"consumer group '{group_id}' not found",
+                                         http_status=404)
+                if (g["cluster"], g["slot"]) != (new_cluster, new_slot):
+                    raise MigrationError(
+                        CONFLICT,
+                        f"group '{group_id}' is on {g['cluster']}/{g['slot']},"
+                        f" not the takeover slot {new_cluster}/{new_slot}",
+                        http_status=409)
+                if g["watermark"] != takeover_cursor:
+                    raise MigrationError(
+                        CONFLICT,
+                        f"group watermark {g['watermark']} differs from the saved "
+                        f"takeover cursor {takeover_cursor}", http_status=409)
+                from_epoch = g["epoch"]
+                to_epoch = from_epoch + 1
+                restoration = {
+                    "cluster": old_cluster, "slot": old_slot,
+                    "epoch": to_epoch, "watermark_source_lsn": takeover_source_cursor,
+                }
+                revocation = build_revocation_fn(restoration, from_epoch)
+                r = cur.execute(
+                    "UPDATE groups SET cluster=?, slot=?, epoch=epoch+1,"
+                    " watermark=?, updated_at=? WHERE group_id=? AND epoch=?",
+                    (old_cluster, old_slot, takeover_source_cursor, now_iso(),
+                     group_id, from_epoch))
+                if r.rowcount != 1:
+                    raise MigrationError(CONFLICT,
+                                         "consumer group epoch changed concurrently",
+                                         http_status=409)
+                r = cur.execute(
+                    "UPDATE plans SET state='WITHDRAWN', revocation_id=?,"
+                    " version=version+1, updated_at=?"
+                    " WHERE plan_id=? AND state='COMPLETED'",
+                    (revocation["revocation_id"], now_iso(), plan_id))
+                if r.rowcount != 1:
+                    raise MigrationError(CONFLICT,
+                                         "plan state changed during withdrawal",
+                                         http_status=409)
+                cur.execute("INSERT INTO revocations VALUES (?,?,?,?,?)",
+                            (revocation["revocation_id"], plan_id,
+                             canonical_json(revocation), revocation["revocation_hash"],
+                             now_iso()))
+                cur.execute(
+                    "INSERT INTO events (plan_id, ts, kind, detail_json)"
+                    " VALUES (?,?,?,?)",
+                    (plan_id, now_iso(), "HANDOFF_REVOKED",
+                     canonical_json({
+                         "revocation_id": revocation["revocation_id"],
+                         "observation_deadline": observation_deadline,
+                         "restoration": restoration,
+                         "takeover_cursor_retained": takeover_cursor,
+                     })))
+                self.conn.commit()
+                return revocation
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_revocation_for_plan(self, plan_id: str) -> dict | None:
+        with self._lock:
+            r = self.conn.execute(
+                "SELECT * FROM revocations WHERE plan_id=? ORDER BY created_at DESC LIMIT 1",
+                (plan_id,)).fetchone()
+        return self._revocation_row(r) if r else None
+
+    def get_revocation(self, revocation_id: str) -> dict | None:
+        with self._lock:
+            r = self.conn.execute("SELECT * FROM revocations WHERE revocation_id=?",
+                                  (revocation_id,)).fetchone()
+        return self._revocation_row(r) if r else None
+
+    @staticmethod
+    def _revocation_row(r) -> dict:
+        return {"revocation_id": r["revocation_id"], "plan_id": r["plan_id"],
+                "revocation": json.loads(r["revocation_json"]),
+                "revocation_hash": r["revocation_hash"],
+                "created_at": r["created_at"]}
 
     # ------------------------------------------------------------------ proofs
     def get_proof(self, proof_id: str) -> dict | None:

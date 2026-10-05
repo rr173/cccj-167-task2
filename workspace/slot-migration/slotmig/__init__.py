@@ -2,7 +2,7 @@
 from .cluster import Cluster, LogEntry
 from .common import MigrationError
 from .controller import MigrationController
-from .proof import verify_proof
+from .proof import verify_proof, verify_revocation
 from .store import Store
 
 __all__ = [
@@ -12,4 +12,5 @@ __all__ = [
     "MigrationError",
     "Store",
     "verify_proof",
+    "verify_revocation",
 ]

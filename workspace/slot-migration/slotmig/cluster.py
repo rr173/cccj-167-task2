@@ -273,6 +273,20 @@ class Cluster:
                                      http_status=404)
             s["status"] = "RETIRED"
 
+    def activate_slot(self, name: str):
+        """Bring a slot back to ACTIVE (used when a handoff is withdrawn).
+        The confirmed cursor is left untouched."""
+        with self._lock:
+            s = self._slots.get(name)
+            if s is None:
+                raise MigrationError(NOT_FOUND, f"slot '{name}' not found on {self.name}",
+                                     http_status=404)
+            s["status"] = "ACTIVE"
+
+    def is_fenced(self, table: str) -> bool:
+        with self._lock:
+            return table in self._fences
+
     def update_slot_confirmed(self, name: str, lsn: int):
         with self._lock:
             s = self._slots.get(name)

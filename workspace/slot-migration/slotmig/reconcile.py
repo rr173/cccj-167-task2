@@ -6,7 +6,16 @@ import html
 from .common import digest_tables, now_iso
 
 
-def build_report(store, clusters, plan_id: str) -> dict:
+# Chinese labels for the machine-readable withdrawal blocking codes.
+_BLOCKING_LABELS = {
+    "OBSERVATION_EXPIRED": "观察期已结束",
+    "TAKEOVER_CONFIRMED": "接管方已确认新记录",
+    "SOURCE_PROTECTION_RELEASED": "原服务已解除保护",
+    "NO_COMPLETED_HANDOFF": "尚未完成交接（观察期未开始）",
+}
+
+
+def build_report(store, clusters, plan_id: str, withdrawal=None) -> dict:
     plan = store.get_plan(plan_id)
     source = clusters[plan.source_cluster]
     target = clusters[plan.target_cluster]
@@ -86,8 +95,13 @@ def build_report(store, clusters, plan_id: str) -> dict:
         "proof": ({"proof_id": proof_row["proof_id"],
                    "proof_hash": proof_row["proof_hash"]}
                   if proof_row else None),
+        "withdrawal": withdrawal,
         "timeline": events,
     }
+
+
+def _blocking_label(code: str) -> str:
+    return _BLOCKING_LABELS.get(code, code)
 
 
 def _slot_or_none(cluster, name):
@@ -95,6 +109,80 @@ def _slot_or_none(cluster, name):
         return cluster.get_slot(name)
     except Exception:
         return None
+
+
+def _render_withdrawal(w, pid) -> str:
+    if not w:
+        return "<p class='muted'>—</p>"
+    phase = w.get("phase")
+    deadline = w.get("deadline")
+    q = w.get("takeover_cursor")
+    p_old = w.get("takeover_source_cursor")
+
+    cursor_rows = (
+        f"<tr><th>接管方开服确认游标（目标 LSN）</th>"
+        f"<td class='num mono'>{_esc(q)}</td></tr>"
+        f"<tr><th>原服务交接前游标（源 LSN）</th>"
+        f"<td class='num mono'>{_esc(p_old)}</td></tr>")
+
+    if phase == "WITHDRAWN":
+        rev = w.get("revocation") or {}
+        return (
+            "<p><span class='warn'>交接已撤回（WITHDRAWN）</span></p>"
+            f"<table>{cursor_rows}"
+            f"<tr><th>观察期截止时间</th><td><code>{_esc(deadline)}</code></td></tr>"
+            "<tr><th>撤回资格</th><td class='muted'>已完成撤回，不可再次撤回</td></tr>"
+            f"<tr><th>撤回凭证 ID</th><td><code>{html.escape(rev.get('revocation_id',''))}</code></td></tr>"
+            f"<tr><th>撤回凭证哈希</th>"
+            f"<td><code class='mono'>{html.escape(rev.get('revocation_hash',''))}</code></td></tr>"
+            f"<tr><th>凭证 JSON</th><td><a href='/plans/{pid}/revocation'>查看</a></td></tr>"
+            "</table>")
+
+    if phase == "PRE_HANDOFF":
+        return (
+            "<p class='muted'>交接尚未完成；观察期将在 cutover 成功后开始。</p>"
+            f"<table>{cursor_rows}"
+            "<tr><th>撤回资格</th><td class='muted'>观察期未开始</td></tr>"
+            "<tr><th>截止时间</th><td class='muted'>—</td></tr></table>")
+
+    # OBSERVATION
+    blocking = w.get("blocking_conditions", [])
+    if w.get("eligible"):
+        eligibility = "<span class='ok'>● 可撤回</span>"
+    else:
+        eligibility = "<span class='bad'>● 不可撤回</span>"
+    remaining_s = (w.get("remaining_ms") or 0) / 1000
+    if blocking:
+        items = "".join(
+            f"<li><b>{html.escape(_blocking_label(b['code']))}</b> "
+            f"<code>{html.escape(b['code'])}</code>"
+            f"<div class='muted'>{html.escape(b['message'])}</div></li>"
+            for b in blocking)
+        block_html = f"<ul class='tl'>{items}</ul>"
+    else:
+        block_html = "<p class='ok'>无阻止条件（观察期内、原服务仍受保护、接管方未确认新记录）。</p>"
+
+    protected = ("<span class='ok'>是</span>" if w.get("source_protected")
+                 else "<span class='bad'>否</span>")
+    advanced = ("<span class='bad'>是</span>"
+                if w.get("takeover_confirmed_new_records")
+                else "<span class='ok'>否</span>")
+    expired = ("<span class='bad'>已结束</span>" if w.get("expired")
+               else "<span class='ok'>进行中</span>")
+
+    return (
+        f"<table>{cursor_rows}"
+        f"<tr><th>观察期窗口</th><td class='num'>{_esc(w.get('window_ms'))} ms</td></tr>"
+        f"<tr><th>截止时间</th><td><code>{_esc(deadline)}</code></td></tr>"
+        f"<tr><th>观察期状态</th><td>{expired}　剩余 "
+        f"<span class='mono'>{remaining_s:.1f} s</span></td></tr>"
+        f"<tr><th>接管方已确认新记录</th><td>{advanced}"
+        f"（水位 <span class='mono'>{_esc(w.get('group_watermark'))}</span>）</td></tr>"
+        f"<tr><th>原服务仍受保护（源围栏）</th><td>{protected}</td></tr>"
+        f"<tr><th>撤回资格</th><td>{eligibility}</td></tr></table>"
+        f"<h2 style='font-size:13.5px;margin-top:10px'>阻止条件</h2>{block_html}"
+        f"<p class='muted'>操作员撤回：<code>POST /plans/{pid}/withdraw</code>"
+        f"（单事务恢复归属、epoch+1、保留游标并出具撤回凭证）</p>")
 
 
 # --------------------------------------------------------------------- HTML
@@ -118,8 +206,9 @@ font-weight:600;color:#fff;vertical-align:middle}
 .st-DRAFT{background:#90a4ae}.st-FROZEN{background:#5c7cfa}
 .st-STREAMING{background:#22b8cf}.st-VERIFIED{background:#2f9e44}
 .st-COMPLETED{background:#087f5b}.st-FAILED{background:#e03131}
-.st-ABORTED{background:#868e96}
+.st-ABORTED{background:#868e96}.st-WITHDRAWN{background:#d9480f}
 .ok{color:#2f9e44;font-weight:600}.bad{color:#e03131;font-weight:600}
+.warn{color:#d9480f;font-weight:600}
 .muted{color:#8a97a3}.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
 .tl{font-size:12.5px;max-height:280px;overflow:auto}
 .tl li{margin:3px 0}
@@ -211,6 +300,8 @@ def render_html(report: dict) -> str:
     else:
         proof_html = "<p class='muted'>切换完成后生成。</p>"
 
+    withdraw_html = _render_withdrawal(report.get("withdrawal"), pid)
+
     timeline = "".join(
         "<li><span class='muted'>{}</span> <b>{}</b> <span class='muted'>{}</span></li>".format(
             html.escape(e["ts"]), html.escape(e["kind"]),
@@ -250,6 +341,7 @@ def render_html(report: dict) -> str:
 <p class="muted">即时比对在增量传输期间可能短暂不一致；权威结论以「校验标记」与切换前最终校验为准。</p></section>
 <section><h2>校验标记（零停机校验）</h2>{ver_html}</section>
 <section><h2>消费者水位</h2>{group_html}</section>
+<section><h2>交接观察期与撤回</h2>{withdraw_html}</section>
 <section><h2>切换证明</h2>{proof_html}</section>
 <section><h2>事件时间线</h2><ul class="tl">{timeline}</ul></section>
 </main></body></html>"""

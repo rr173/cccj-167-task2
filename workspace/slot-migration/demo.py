@@ -162,6 +162,37 @@ def main():
     print(f"\n对账页面:  http://{HOST}:{PORT}/plans/{pid}/reconcile.html")
     print(f"证明 JSON: http://{HOST}:{PORT}/plans/{pid}/proof")
 
+    banner("8. 观察期撤回（交接成功后仍可回退）")
+    _, w = call("GET", f"/plans/{pid}/withdrawal")
+    print(f"阶段={w['phase']}  截止={w['deadline']}  剩余={w['remaining_ms']}ms")
+    print(f"接管方开服确认游标(目标LSN)={w['takeover_cursor']}  "
+          f"原服务游标(源LSN)={w['takeover_source_cursor']}")
+    print(f"撤回资格={w['eligible']}  阻止条件={w['blocking_conditions']}")
+    _, rev = call("POST", f"/plans/{pid}/withdraw")
+    print(f"已撤回  revocation_id={rev['revocation_id']}")
+    print(f"revocation_hash={rev['revocation_hash']}")
+    r = rev["restoration"]
+    print(f"归属恢复：{r['cluster']}/{r['slot']} epoch={r['epoch']} "
+          f"水位={r['watermark_source_lsn']}（游标保留，未重置）")
+    _, verdict = call("POST", "/revocations/verify", {"revocation": rev})
+    print(f"撤回凭证独立验证 → {'有效' if verdict['valid'] else '无效'}")
+    for c in verdict["checks"]:
+        print(f"  [{'✓' if c['ok'] else '✗'}] {c['check']}  {c.get('detail','')}")
+
+    # same request again → existing result (idempotent)
+    _, rev_again = call("POST", f"/plans/{pid}/withdraw")
+    print(f"重复撤回请求 → 返回既有凭证 {rev_again['revocation_id'] == rev['revocation_id']}")
+
+    _, group = call("GET", "/groups/analytics")
+    print(f"消费者组当前：{group['cluster']}/{group['slot']} "
+          f"epoch={group['epoch']} watermark={group['watermark']}")
+    _, wrote = call("POST", "/clusters/source/write",
+                    {"table": "orders", "key": "post-revoke",
+                     "value": {"ok": True}})
+    print(f"源围栏已解除、源槽恢复 ACTIVE：新写入被接受 lsn={wrote['lsn']}")
+    _, report = call("GET", f"/plans/{pid}/reconcile")
+    print(f"对账页撤回区块阶段：{report['withdrawal']['phase']}")
+
     if args.serve:
         print("\n按 Ctrl+C 停止服务…")
         try:
