@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 
 from .common import (
     CONFLICT,
+    DEFAULT_OBSERVATION_SECONDS,
     INVALID_STATE,
     NOT_FOUND,
+    TAKEOVER_PROGRESSED,
     MigrationError,
     canonical_json,
     new_id,
@@ -45,6 +47,10 @@ CREATE TABLE IF NOT EXISTS plans (
   proof_id TEXT,
   error_code TEXT,
   error_message TEXT,
+  observation_seconds INTEGER NOT NULL DEFAULT 300,
+  cutover_at TEXT,
+  takeover_cursor_json TEXT,
+  revocation_id TEXT,
   version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -99,12 +105,23 @@ CREATE TABLE IF NOT EXISTS groups (
 CREATE TABLE IF NOT EXISTS proofs (
   proof_id TEXT PRIMARY KEY,
   plan_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'CUTOVER',
   proof_json TEXT NOT NULL,
   proof_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 """
 
+# Additive migrations for databases created by older versions.
+_PLAN_COLUMN_MIGRATIONS = (
+    ("observation_seconds",
+     f"ALTER TABLE plans ADD COLUMN observation_seconds INTEGER NOT NULL "
+     f"DEFAULT {DEFAULT_OBSERVATION_SECONDS}"),
+    ("cutover_at", "ALTER TABLE plans ADD COLUMN cutover_at TEXT"),
+    ("takeover_cursor_json",
+     "ALTER TABLE plans ADD COLUMN takeover_cursor_json TEXT"),
+    ("revocation_id", "ALTER TABLE plans ADD COLUMN revocation_id TEXT"),
+)
 # Plan fields that transition() is allowed to set (SQL-injection whitelist).
 UPDATABLE_FIELDS = {
     "attempt", "schema_versions_json", "frozen_lsn", "snapshot_id",
@@ -112,7 +129,7 @@ UPDATABLE_FIELDS = {
     "proof_id", "error_code", "error_message",
 }
 
-TERMINAL_STATES = ("COMPLETED", "ABORTED")
+TERMINAL_STATES = ("COMPLETED", "ABORTED", "REVOKED")
 
 
 @dataclass
@@ -136,6 +153,10 @@ class Plan:
     proof_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    observation_seconds: int = DEFAULT_OBSERVATION_SECONDS
+    cutover_at: str | None = None
+    takeover_cursor: dict | None = None
+    revocation_id: str | None = None
     version: int = 0
     created_at: str = ""
     updated_at: str = ""
@@ -159,6 +180,10 @@ class Plan:
             "verify_marker_lsn": self.verify_marker_lsn,
             "cutover_lsn": self.cutover_lsn,
             "proof_id": self.proof_id,
+            "observation_seconds": self.observation_seconds,
+            "cutover_at": self.cutover_at,
+            "takeover_cursor": self.takeover_cursor,
+            "revocation_id": self.revocation_id,
             "error": {"code": self.error_code, "message": self.error_message}
                      if self.error_code else None,
             "version": self.version,
@@ -174,6 +199,22 @@ class Store:
         self._lock = threading.RLock()
         with self._lock, self.conn:
             self.conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self):
+        """Apply additive column migrations to pre-existing databases."""
+        plan_cols = {r["name"] for r in
+                     self.conn.execute("PRAGMA table_info(plans)")}
+        for name, ddl in _PLAN_COLUMN_MIGRATIONS:
+            if name not in plan_cols:
+                self.conn.execute(ddl)
+        proof_cols = {r["name"] for r in
+                      self.conn.execute("PRAGMA table_info(proofs)")}
+        if proof_cols and "kind" not in proof_cols:
+            # existing rows are cutover proofs — backfill the discriminator
+            self.conn.execute(
+                "ALTER TABLE proofs ADD COLUMN kind TEXT NOT NULL "
+                "DEFAULT 'CUTOVER'")
 
     def close(self):
         with self._lock:
@@ -194,16 +235,24 @@ class Store:
             snapshot_lsn=d["snapshot_lsn"], verify_digest=d["verify_digest"],
             verify_marker_lsn=d["verify_marker_lsn"], cutover_lsn=d["cutover_lsn"],
             proof_id=d["proof_id"], error_code=d["error_code"],
-            error_message=d["error_message"], version=d["version"],
+            error_message=d["error_message"],
+            observation_seconds=d["observation_seconds"],
+            cutover_at=d["cutover_at"],
+            takeover_cursor=(json.loads(d["takeover_cursor_json"])
+                             if d["takeover_cursor_json"] else None),
+            revocation_id=d["revocation_id"],
+            version=d["version"],
             created_at=d["created_at"], updated_at=d["updated_at"],
         )
 
     def create_plan(self, spec: dict) -> Plan:
         plan_id = new_id("plan")
         now = now_iso()
+        observation_seconds = int(spec.get("observation_seconds",
+                                           DEFAULT_OBSERVATION_SECONDS))
         with self._lock, self.conn:
             clash = self.conn.execute(
-                "SELECT plan_id FROM plans WHERE state NOT IN ('COMPLETED','ABORTED') AND ("
+                "SELECT plan_id FROM plans WHERE state NOT IN ('COMPLETED','ABORTED','REVOKED') AND ("
                 " (source_cluster=? AND source_slot=?) OR"
                 " (target_cluster=? AND target_slot=?) OR"
                 " consumer_group=? )",
@@ -219,10 +268,11 @@ class Store:
             self.conn.execute(
                 "INSERT INTO plans (plan_id, state, attempt, source_cluster, source_slot,"
                 " target_cluster, target_slot, consumer_group, tables_json,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " observation_seconds, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (plan_id, "DRAFT", 1, spec["source_cluster"], spec["source_slot"],
                  spec["target_cluster"], spec["target_slot"], spec["consumer_group"],
-                 json.dumps(spec["tables"]), now, now))
+                 json.dumps(spec["tables"]), observation_seconds, now, now))
         return self.get_plan(plan_id)
 
     def get_plan(self, plan_id: str) -> Plan:
@@ -401,7 +451,8 @@ class Store:
     # ----------------------------------------------------------------- cutover
     def execute_cutover(self, *, plan_id: str, attempt: int, group_id: str,
                         expected_epoch: int, new_cluster: str, new_slot: str,
-                        cutover_lsn: int, build_proof_fn) -> dict:
+                        cutover_lsn: int, target_confirmed_lsn: int,
+                        at_iso: str, build_proof_fn) -> dict:
         """The atomic switch. In ONE transaction:
 
         1. re-read the group (epoch fence check);
@@ -409,7 +460,10 @@ class Store:
         3. build + persist the cutover proof;
         4. bump the epoch, repoint the group at the new slot, set the
            remapped watermark;
-        5. mark the plan COMPLETED.
+        5. mark the plan COMPLETED, recording the cutover instant (which opens
+           the observation window) and the takeover cursor — the new side's
+           confirmed cursor at the moment service starts, the baseline against
+           which later revocation eligibility is decided.
 
         Any failure rolls everything back — the group keeps consuming the old
         slot and the plan stays VERIFIED (the cutover is retryable).
@@ -441,6 +495,12 @@ class Store:
                     "mapping_anchor": {"source_lsn": p_old, "target_lsn": q},
                 }
                 proof = build_proof_fn(handoff)
+                takeover_cursor = canonical_json({
+                    "cluster": new_cluster, "slot": new_slot,
+                    "epoch": g["epoch"] + 1, "confirmed_lsn": target_confirmed_lsn,
+                    "group_watermark": q,
+                    "saved_at": at_iso,
+                })
                 r = cur.execute(
                     "UPDATE groups SET cluster=?, slot=?, epoch=epoch+1, watermark=?,"
                     " updated_at=? WHERE group_id=? AND epoch=?",
@@ -450,17 +510,141 @@ class Store:
                                          http_status=409)
                 r = cur.execute(
                     "UPDATE plans SET state='COMPLETED', cutover_lsn=?, proof_id=?,"
+                    " cutover_at=?, takeover_cursor_json=?,"
                     " version=version+1, updated_at=?"
                     " WHERE plan_id=? AND state='VERIFIED'",
-                    (cutover_lsn, proof["proof_id"], now_iso(), plan_id))
+                    (cutover_lsn, proof["proof_id"], at_iso, takeover_cursor,
+                     now_iso(), plan_id))
                 if r.rowcount != 1:
                     raise MigrationError(CONFLICT, "plan state changed during cutover",
                                          http_status=409)
-                cur.execute("INSERT INTO proofs VALUES (?,?,?,?,?)",
-                            (proof["proof_id"], plan_id, canonical_json(proof),
-                             proof["proof_hash"], now_iso()))
+                cur.execute(
+                    "INSERT INTO proofs (proof_id, plan_id, kind, proof_json,"
+                    " proof_hash, created_at) VALUES (?,?,?,?,?,?)",
+                    (proof["proof_id"], plan_id, "CUTOVER", canonical_json(proof),
+                     proof["proof_hash"], now_iso()))
                 self.conn.commit()
                 return proof
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    # --------------------------------------------------------------- revocation
+    def execute_revocation(self, *, plan_id: str, group_id: str,
+                           takeover_epoch: int, takeover_watermark: int,
+                           at_iso: str, build_revocation_fn) -> dict:
+        """Atomically revoke a cutover during the observation window.
+
+        In ONE transaction:
+
+        1. re-read the plan (must still be COMPLETED with the saved takeover
+           cursor) and re-check that the takeover side has NOT confirmed any
+           new record (group watermark unchanged from the takeover cursor);
+        2. derive the original ownership and the retained source cursor from
+           the persisted cutover proof (its mapping anchor);
+        3. bump the fencing epoch again and repoint the group back to the
+           original slot with its old watermark — the cursor is retained,
+           never reset;
+        4. build + persist the tamper-evident revocation credential;
+        5. mark the plan REVOKED.
+
+        Any failure rolls everything back: the takeover stays in effect and
+        all runtime state is untouched.
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                p = cur.execute("SELECT * FROM plans WHERE plan_id=?",
+                                (plan_id,)).fetchone()
+                if p is None:
+                    raise MigrationError(NOT_FOUND, f"plan '{plan_id}' not found",
+                                         http_status=404)
+                if p["state"] == "REVOKED":
+                    raise MigrationError(CONFLICT, "handover already revoked",
+                                         http_status=409)
+                if p["state"] != "COMPLETED":
+                    raise MigrationError(
+                        CONFLICT,
+                        f"plan {plan_id} is {p['state']}; no handoff to revoke",
+                        http_status=409)
+                cutover_row = cur.execute(
+                    "SELECT proof_json FROM proofs WHERE proof_id=? AND kind='CUTOVER'",
+                    (p["proof_id"],)).fetchone()
+                if cutover_row is None:
+                    raise MigrationError(CONFLICT,
+                                         "cutover proof missing; cannot revoke")
+                cutover_proof = json.loads(cutover_row["proof_json"])
+                anchor = cutover_proof["handoff"]["mapping_anchor"]
+                source_watermark = anchor["source_lsn"]
+                target_watermark = anchor["target_lsn"]
+
+                g = cur.execute("SELECT * FROM groups WHERE group_id=?",
+                                (group_id,)).fetchone()
+                if g is None:
+                    raise MigrationError(NOT_FOUND,
+                                         f"consumer group '{group_id}' not found",
+                                         http_status=404)
+                if g["epoch"] != takeover_epoch:
+                    raise MigrationError(CONFLICT,
+                                         "consumer group epoch changed concurrently",
+                                         http_status=409)
+                # The takeover side must not have confirmed any new record.
+                if g["watermark"] != takeover_watermark:
+                    raise MigrationError(
+                        TAKEOVER_PROGRESSED,
+                        "the takeover side has confirmed new records; "
+                        "the handoff can no longer be revoked",
+                        {"takeover_cursor_lsn": takeover_watermark,
+                         "current_lsn": g["watermark"]},
+                        http_status=409)
+
+                original = cutover_proof["handoff"]["old"]
+                handoff_back = {
+                    "group": group_id,
+                    "from": {"cluster": g["cluster"], "slot": g["slot"],
+                             "epoch": g["epoch"],
+                             "watermark_target_lsn": g["watermark"]},
+                    "restored": {"cluster": original["cluster"],
+                                 "slot": original["slot"],
+                                 "epoch": g["epoch"] + 1,
+                                 "watermark_source_lsn": source_watermark},
+                    "retained_cursor": {
+                        "source_lsn": source_watermark,
+                        "target_lsn": target_watermark,
+                        "cutover_proof_id": cutover_proof["proof_id"],
+                        "cutover_proof_hash": cutover_proof["proof_hash"],
+                    },
+                }
+                credential = build_revocation_fn(handoff_back)
+
+                r = cur.execute(
+                    "UPDATE groups SET cluster=?, slot=?, epoch=epoch+1,"
+                    " watermark=?, updated_at=?"
+                    " WHERE group_id=? AND epoch=? AND watermark=?",
+                    (original["cluster"], original["slot"], source_watermark,
+                     now_iso(), group_id, takeover_epoch, takeover_watermark))
+                if r.rowcount != 1:
+                    raise MigrationError(TAKEOVER_PROGRESSED,
+                                         "takeover progressed during revocation",
+                                         http_status=409)
+                r = cur.execute(
+                    "UPDATE plans SET state='REVOKED', revocation_id=?,"
+                    " version=version+1, updated_at=?"
+                    " WHERE plan_id=? AND state='COMPLETED'",
+                    (credential["revocation_id"], now_iso(), plan_id))
+                if r.rowcount != 1:
+                    raise MigrationError(CONFLICT,
+                                         "plan state changed during revocation",
+                                         http_status=409)
+                cur.execute(
+                    "INSERT INTO proofs (proof_id, plan_id, kind, proof_json,"
+                    " proof_hash, created_at) VALUES (?,?,?,?,?,?)",
+                    (credential["revocation_id"], plan_id, "REVOCATION",
+                     canonical_json(credential), credential["revocation_hash"],
+                     now_iso()))
+                self.conn.commit()
+                return credential
             except Exception:
                 self.conn.rollback()
                 raise
@@ -475,12 +659,28 @@ class Store:
     def get_proof_for_plan(self, plan_id: str) -> dict | None:
         with self._lock:
             r = self.conn.execute(
-                "SELECT * FROM proofs WHERE plan_id=? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM proofs WHERE plan_id=? AND kind='CUTOVER'"
+                " ORDER BY created_at DESC LIMIT 1",
                 (plan_id,)).fetchone()
         return self._proof_row(r) if r else None
+
+    def get_revocation_for_plan(self, plan_id: str) -> dict | None:
+        with self._lock:
+            r = self.conn.execute(
+                "SELECT * FROM proofs WHERE plan_id=? AND kind='REVOCATION'"
+                " ORDER BY created_at DESC LIMIT 1",
+                (plan_id,)).fetchone()
+        return self._proof_row(r) if r else None
+
+    def get_all_proofs_for_plan(self, plan_id: str) -> list:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM proofs WHERE plan_id=? ORDER BY rowid",
+                (plan_id,)).fetchall()
+        return [self._proof_row(r) for r in rows]
 
     @staticmethod
     def _proof_row(r) -> dict:
         return {"proof_id": r["proof_id"], "plan_id": r["plan_id"],
-                "proof": json.loads(r["proof_json"]), "proof_hash": r["proof_hash"],
-                "created_at": r["created_at"]}
+                "kind": r["kind"], "proof": json.loads(r["proof_json"]),
+                "proof_hash": r["proof_hash"], "created_at": r["created_at"]}

@@ -4,11 +4,30 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def parse_iso(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp (as produced by now_iso) into aware UTC."""
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def iso_add_seconds(value: str, seconds: int) -> str:
+    return (parse_iso(value) + timedelta(seconds=seconds)).isoformat(
+        timespec="milliseconds")
+
+
+def seconds_between(later: str, earlier: str) -> float:
+    return (parse_iso(later) - parse_iso(earlier)).total_seconds()
+
+
+# Post-cutover observation window in which the operator may revoke the handoff.
+DEFAULT_OBSERVATION_SECONDS = 300
 
 
 def new_id(prefix: str) -> str:
@@ -81,3 +100,7 @@ TARGET_NOT_EMPTY = "TARGET_NOT_EMPTY"
 RETRY_NOT_ALLOWED = "RETRY_NOT_ALLOWED"
 DRAIN_INCOMPLETE = "DRAIN_INCOMPLETE"
 LOAD_MISMATCH = "LOAD_MISMATCH"
+TAKEOVER_PROGRESSED = "TAKEOVER_PROGRESSED"
+SOURCE_NOT_PROTECTED = "SOURCE_NOT_PROTECTED"
+OBSERVATION_EXPIRED = "OBSERVATION_EXPIRED"
+REVOKE_NOT_ALLOWED = "REVOKE_NOT_ALLOWED"

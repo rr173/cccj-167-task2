@@ -3,10 +3,115 @@ from __future__ import annotations
 
 import html
 
-from .common import digest_tables, now_iso
+from .common import (
+    OBSERVATION_EXPIRED,
+    SOURCE_NOT_PROTECTED,
+    TAKEOVER_PROGRESSED,
+    digest_tables,
+    iso_add_seconds,
+    now_iso,
+    seconds_between,
+)
 
 
-def build_report(store, clusters, plan_id: str) -> dict:
+def observation_status(store, clusters, plan, *, now=None) -> dict | None:
+    """Revocation eligibility for the post-cutover observation window.
+
+    Returns None before a cutover. For COMPLETED plans it evaluates the three
+    revocation conditions (window open, no takeover confirmation, source
+    still protected); for REVOKED plans it returns the frozen record.
+    """
+    if plan.state not in ("COMPLETED", "REVOKED") or not plan.cutover_at:
+        return None
+    current = now or now_iso()
+    deadline = iso_add_seconds(plan.cutover_at, plan.observation_seconds)
+    elapsed = max(0.0, seconds_between(current, plan.cutover_at))
+    remaining = seconds_between(deadline, current)
+
+    source = clusters[plan.source_cluster]
+    target = clusters[plan.target_cluster]
+    try:
+        group = store.get_group(plan.consumer_group)
+    except Exception:
+        group = None
+
+    result = {
+        "window_seconds": plan.observation_seconds,
+        "cutover_at": plan.cutover_at,
+        "deadline": deadline,
+        "elapsed_seconds": round(elapsed, 3),
+        "remaining_seconds": round(remaining, 3),
+        "takeover_cursor": plan.takeover_cursor,
+        "blocking_conditions": [],
+        "rejection_reason": None,
+        "revocation_id": plan.revocation_id,
+    }
+
+    if plan.state == "REVOKED":
+        result["status"] = "revoked"
+        result["eligible"] = False
+        return result
+
+    result["status"] = "expired" if remaining <= 0 else "open"
+
+    takeover_progressed = False
+    current_cursor = None
+    if group is not None:
+        current_cursor = {
+            "cluster": group["cluster"], "slot": group["slot"],
+            "epoch": group["epoch"], "group_watermark": group["watermark"],
+        }
+        saved = plan.takeover_cursor or {}
+        if (group["watermark"] != saved.get("group_watermark")
+                or group["epoch"] != saved.get("epoch")):
+            takeover_progressed = True
+    else:
+        takeover_progressed = True
+    try:
+        t_slot = target.get_slot(plan.target_slot)
+        confirmed_now = t_slot["confirmed_lsn"]
+    except Exception:
+        confirmed_now = None
+        t_slot = None
+    saved_confirmed = (plan.takeover_cursor or {}).get("confirmed_lsn")
+    if confirmed_now is not None and saved_confirmed is not None \
+            and confirmed_now > saved_confirmed:
+        takeover_progressed = True
+    result["current_cursor"] = current_cursor
+    result["target_slot_confirmed_lsn"] = confirmed_now
+
+    token = f"plan:{plan.plan_id}:{plan.attempt}"
+    source_protected = source.tables_fenced_by(plan.tables, token)
+    result["source_protected"] = source_protected
+    result["fence_token"] = token if source_protected else None
+    try:
+        result["source_slot_status"] = source.get_slot(
+            plan.source_slot)["status"]
+    except Exception:
+        result["source_slot_status"] = None
+    result["target_slot_status"] = (t_slot or {}).get("status")
+
+    if takeover_progressed:
+        result["blocking_conditions"].append({
+            "code": TAKEOVER_PROGRESSED,
+            "reason": "接管方已确认新记录（消费者水位或槽确认位点已推进）"})
+    if not source_protected:
+        result["blocking_conditions"].append({
+            "code": SOURCE_NOT_PROTECTED,
+            "reason": "原服务已解除保护（源表写围栏已释放）"})
+    if remaining <= 0:
+        result["blocking_conditions"].append({
+            "code": OBSERVATION_EXPIRED,
+            "reason": f"观察期已于 {deadline} 结束"})
+
+    result["eligible"] = not result["blocking_conditions"]
+    if result["blocking_conditions"]:
+        # precedence: takeover progress is the strongest bar
+        result["rejection_reason"] = result["blocking_conditions"][0]["code"]
+    return result
+
+
+def build_report(store, clusters, plan_id: str, now=None) -> dict:
     plan = store.get_plan(plan_id)
     source = clusters[plan.source_cluster]
     target = clusters[plan.target_cluster]
@@ -17,6 +122,7 @@ def build_report(store, clusters, plan_id: str) -> dict:
     markers = store.get_markers(plan_id, plan.attempt)
     snapshot = store.get_snapshot(plan.snapshot_id) if plan.snapshot_id else None
     proof_row = store.get_proof_for_plan(plan_id)
+    revocation_row = store.get_revocation_for_plan(plan_id)
     events = store.get_events(plan_id)
 
     try:
@@ -86,6 +192,10 @@ def build_report(store, clusters, plan_id: str) -> dict:
         "proof": ({"proof_id": proof_row["proof_id"],
                    "proof_hash": proof_row["proof_hash"]}
                   if proof_row else None),
+        "observation": observation_status(store, clusters, plan, now=now),
+        "revocation": ({"revocation_id": revocation_row["proof_id"],
+                        "revocation_hash": revocation_row["proof_hash"]}
+                       if revocation_row else None),
         "timeline": events,
     }
 
@@ -118,12 +228,20 @@ font-weight:600;color:#fff;vertical-align:middle}
 .st-DRAFT{background:#90a4ae}.st-FROZEN{background:#5c7cfa}
 .st-STREAMING{background:#22b8cf}.st-VERIFIED{background:#2f9e44}
 .st-COMPLETED{background:#087f5b}.st-FAILED{background:#e03131}
-.st-ABORTED{background:#868e96}
+.st-ABORTED{background:#868e96}.st-REVOKED{background:#d9480f}
 .ok{color:#2f9e44;font-weight:600}.bad{color:#e03131;font-weight:600}
 .muted{color:#8a97a3}.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
 .tl{font-size:12.5px;max-height:280px;overflow:auto}
 .tl li{margin:3px 0}
+.tl .ev-CUTOVER_EXECUTED{color:#087f5b;font-weight:700}
+.tl .ev-HANDOVER_REVOKED{color:#d9480f;font-weight:700}
 a{color:#1971c2}
+.badge-ok{display:inline-block;background:#ebfbee;color:#2f9e44;border:1px solid #b2f2bb;
+border-radius:6px;padding:2px 10px;font-size:12.5px;font-weight:600}
+.badge-warn{display:inline-block;background:#fff4e6;color:#d9480f;border:1px solid #ffc078;
+border-radius:6px;padding:2px 10px;font-size:12.5px;font-weight:600}
+.badge-off{display:inline-block;background:#f1f3f5;color:#868e96;border:1px solid #dee2e6;
+border-radius:6px;padding:2px 10px;font-size:12.5px;font-weight:600}
 """
 
 _POSITION_LABELS = [
@@ -205,16 +323,87 @@ def render_html(report: dict) -> str:
 
     if proof:
         proof_html = (
-            f"<p>证明 ID：<code>{html.escape(proof['proof_id'])}</code><br>"
+            f"<p>切换证明 ID：<code>{html.escape(proof['proof_id'])}</code><br>"
             f"证明哈希：<code class='mono'>{html.escape(proof['proof_hash'])}</code></p>"
             f"<p><a href='/plans/{pid}/proof'>查看切换证明 JSON</a></p>")
     else:
         proof_html = "<p class='muted'>切换完成后生成。</p>"
 
+    obs = report.get("observation")
+    rev = report.get("revocation")
+    if obs is None:
+        observation_html = (
+            "<p class='muted'>交接完成后进入可配置的观察期，此处在交接后显示。</p>")
+    elif obs["status"] == "revoked":
+        observation_html = (
+            "<p><span class='badge-warn'>交接已撤回</span>　归属已恢复到原服务，"
+            "fencing epoch 已再次递增，原游标保留。</p>"
+            f"<table><tr><th>观察期时长</th><th>交接时间</th><th>观察截止</th>"
+            f"<th>撤回凭证</th></tr><tr>"
+            f"<td class='num'>{obs['window_seconds']} 秒</td>"
+            f"<td class='mono'>{html.escape(obs['cutover_at'])}</td>"
+            f"<td class='mono'>{html.escape(obs['deadline'])}</td>"
+            f"<td><code>{html.escape(obs.get('revocation_id') or '—')}</code></td>"
+            "</tr></table>"
+            "<p class='muted'>重复撤回请求只返回既有撤回凭证，不产生新的状态变化。</p>")
+    else:
+        if obs["eligible"]:
+            badge = "<span class='badge-ok'>可撤回</span>"
+            hint = ("观察期内、接管方尚未确认任何新记录、原服务仍处于保护状态；"
+                    "操作员可调用 <code>POST /plans/{id}/revoke</code> 撤回交接。")
+        else:
+            badge = "<span class='badge-warn'>不可撤回</span>"
+            hint = "存在阻止条件，撤回请求会被拒绝且所有运行状态保持不变："
+        blocks = "".join(
+            "<li><b>{}</b>：{}</li>".format(html.escape(b["code"]),
+                                           html.escape(b["reason"]))
+            for b in obs["blocking_conditions"])
+        blocked = {b["code"] for b in obs["blocking_conditions"]}
+        progressed = "TAKEOVER_PROGRESSED" in blocked
+        protected = obs["source_protected"]
+        window_open = obs["status"] == "open"
+        cursor = obs.get("takeover_cursor") or {}
+        cur_cursor = obs.get("current_cursor") or {}
+        observation_html = (
+            f"<p>{badge}　{hint}</p>"
+            f"<table><tr><th>观察期</th><th>交接时间</th><th>截止时间</th>"
+            f"<th>剩余秒数</th><th>已用秒数</th></tr><tr>"
+            f"<td class='num'>{obs['window_seconds']} 秒</td>"
+            f"<td class='mono'>{html.escape(obs['cutover_at'])}</td>"
+            f"<td class='mono'>{html.escape(obs['deadline'])}</td>"
+            f"<td class='num'>{obs['remaining_seconds']}</td>"
+            f"<td class='num'>{obs['elapsed_seconds']}</td></tr></table>"
+            f"<table style='margin-top:8px'><tr><th>条件</th><th>当前值</th>"
+            f"<th>结论</th></tr>"
+            f"<tr><td>接管方未确认新记录</td>"
+            f"<td>接管起始水位 <code>{_esc(cursor.get('group_watermark'))}</code>"
+            f" / 当前水位 <code>{_esc(cur_cursor.get('group_watermark'))}</code>"
+            f"；接管槽确认位点 <code>{_esc(cursor.get('confirmed_lsn'))}</code>"
+            f" → <code>{_esc(obs.get('target_slot_confirmed_lsn'))}</code></td>"
+            f"<td class='{'ok' if not progressed else 'bad'}'>"
+            f"{'未推进' if not progressed else '已确认新记录'}</td></tr>"
+            f"<tr><td>原服务仍处于保护状态</td>"
+            f"<td>源槽状态 <code>{_esc(obs.get('source_slot_status'))}</code>"
+            f"；围栏 token <code>{html.escape(str(obs.get('fence_token') or '—'))}</code></td>"
+            f"<td class='{'ok' if protected else 'bad'}'>"
+            f"{'保护中' if protected else '已解除保护'}</td></tr>"
+            f"<tr><td>观察期未结束</td>"
+            f"<td>状态 <code>{obs['status']}</code></td>"
+            f"<td class='{'ok' if window_open else 'bad'}'>"
+            f"{'进行中' if window_open else '已结束'}</td></tr>"
+            f"</table>"
+            + (f"<ul>{blocks}</ul>" if blocks else ""))
+        if rev:
+            observation_html += (
+                f"<p class='muted'>撤回凭证：<code>{html.escape(rev['revocation_id'])}</code>"
+                f"（<code class='mono'>{html.escape(rev['revocation_hash'])}</code>）"
+                f"　<a href='/plans/{pid}/revocation'>查看撤回凭证 JSON</a></p>")
+
     timeline = "".join(
-        "<li><span class='muted'>{}</span> <b>{}</b> <span class='muted'>{}</span></li>".format(
-            html.escape(e["ts"]), html.escape(e["kind"]),
-            html.escape(str(e["detail"])[:220]))
+        "<li class='ev-{kind}'><span class='muted'>{ts}</span> <b>{kind}</b>"
+        " <span class='muted'>{detail}</span></li>".format(
+            ts=html.escape(e["ts"]), kind=html.escape(e["kind"]),
+            detail=html.escape(str(e["detail"])[:220]))
         for e in reversed(report["timeline"][-60:]))
 
     err = ""
@@ -251,5 +440,6 @@ def render_html(report: dict) -> str:
 <section><h2>校验标记（零停机校验）</h2>{ver_html}</section>
 <section><h2>消费者水位</h2>{group_html}</section>
 <section><h2>切换证明</h2>{proof_html}</section>
-<section><h2>事件时间线</h2><ul class="tl">{timeline}</ul></section>
+<section><h2>交接观察期与撤回资格</h2>{observation_html}</section>
+<section><h2>事件时间线（交接 / 撤回事件）</h2><ul class="tl">{timeline}</ul></section>
 </main></body></html>"""

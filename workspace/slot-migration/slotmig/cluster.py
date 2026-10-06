@@ -122,6 +122,15 @@ class Cluster:
         with self._lock:
             return sorted(self._fences)
 
+    def fence_token_for(self, table: str) -> str | None:
+        with self._lock:
+            return self._fences.get(table)
+
+    def tables_fenced_by(self, tables, token: str) -> bool:
+        """True when every table is held by exactly this fence token."""
+        with self._lock:
+            return all(self._fences.get(t) == token for t in tables)
+
     def scan(self, after_lsn: int) -> list:
         """All log entries with lsn > after_lsn, in order."""
         with self._lock:
@@ -272,6 +281,19 @@ class Cluster:
                 raise MigrationError(NOT_FOUND, f"slot '{name}' not found on {self.name}",
                                      http_status=404)
             s["status"] = "RETIRED"
+
+    def activate_slot(self, name: str, confirmed_lsn: int | None = None):
+        """Reactivate a RETIRED slot (revocation of a handoff). The confirmed
+        cursor is restored, never reset: the resumed original consumer picks
+        up exactly at the cursor it held before the switch."""
+        with self._lock:
+            s = self._slots.get(name)
+            if s is None:
+                raise MigrationError(NOT_FOUND, f"slot '{name}' not found on {self.name}",
+                                     http_status=404)
+            if confirmed_lsn is not None and confirmed_lsn > s["confirmed_lsn"]:
+                s["confirmed_lsn"] = confirmed_lsn
+            s["status"] = "ACTIVE"
 
     def update_slot_confirmed(self, name: str, lsn: int):
         with self._lock:

@@ -162,6 +162,39 @@ def main():
     print(f"\n对账页面:  http://{HOST}:{PORT}/plans/{pid}/reconcile.html")
     print(f"证明 JSON: http://{HOST}:{PORT}/plans/{pid}/proof")
 
+    banner("8. 观察期与撤回交接（接管方未确认新记录、源仍受保护）")
+    obs = report["observation"]
+    print(f"观察期 {obs['window_seconds']} 秒，截止 {obs['deadline']}，"
+          f"剩余 {obs['remaining_seconds']} 秒")
+    print(f"撤回资格：{'可撤回' if obs['eligible'] else '不可撤回'}  "
+          f"阻止条件：{[b['code'] for b in obs['blocking_conditions']] or '无'}")
+    cursor = obs["takeover_cursor"]
+    print(f"接管起始游标：{cursor['cluster']}/{cursor['slot']} "
+          f"epoch={cursor['epoch']} 水位={cursor['group_watermark']}")
+
+    # 演示"接管方已确认新记录 → 拒绝撤回"的场景在另一张计划上代价较大，
+    # 这里直接演示当前（符合条件的）撤回。
+    _, credential = call("POST", f"/plans/{pid}/revoke")
+    print(f"已撤回  revocation_id={credential['revocation_id']}")
+    print(f"        revocation_hash={credential['revocation_hash']}")
+    _, verdict = call("POST", "/proofs/verify", {"proof": credential})
+    print("撤回凭证独立验证：")
+    for c in verdict["checks"]:
+        print(f"  [{'✓' if c['ok'] else '✗'}] {c['check']}  {c.get('detail','')}")
+    print(f"→ 撤回凭证{'有效' if verdict['valid'] else '无效'}")
+    _, group = call("GET", "/groups/analytics")
+    print(f"归属恢复：{group['cluster']}/{group['slot']} epoch={group['epoch']} "
+          f"水位={group['watermark']}（原游标保留，epoch 已再次递增）")
+
+    # 幂等：再次撤回只返回既有凭证
+    _, again = call("POST", f"/plans/{pid}/revoke")
+    print(f"重复撤回幂等：{again['revocation_id'] == credential['revocation_id']}")
+
+    _, report2 = call("GET", f"/plans/{pid}/reconcile")
+    print(f"对账页面观察期状态：{report2['observation']['status']}  "
+          f"计划状态：{report2['plan']['state']}")
+    print(f"撤回凭证 JSON: http://{HOST}:{PORT}/plans/{pid}/revocation")
+
     if args.serve:
         print("\n按 Ctrl+C 停止服务…")
         try:

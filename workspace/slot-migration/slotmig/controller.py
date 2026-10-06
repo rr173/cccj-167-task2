@@ -28,33 +28,45 @@ from .common import (
     BAD_REQUEST,
     CONFLICT,
     DRAIN_INCOMPLETE,
+    DEFAULT_OBSERVATION_SECONDS,
     FINAL_MISMATCH,
     FUTURE_EPOCH,
     INVALID_STATE,
     LOAD_MISMATCH,
     NOT_FOUND,
+    OBSERVATION_EXPIRED,
     RETRY_NOT_ALLOWED,
     SCHEMA_CHANGED,
     SLOT_NOT_ACTIVE,
+    SOURCE_NOT_PROTECTED,
     STALE_EPOCH,
+    TAKEOVER_PROGRESSED,
     VERIFY_MISMATCH,
     MigrationError,
     canonical_json,
     digest_tables,
+    iso_add_seconds,
     new_id,
     now_iso,
     sha256_hex,
     table_summary,
 )
+from .reconcile import observation_status
 
 NONTERMINAL = ("DRAFT", "FROZEN", "STREAMING", "VERIFIED")
 
 
 class MigrationController:
-    def __init__(self, clusters: dict, store):
+    def __init__(self, clusters: dict, store, clock=None):
         self.clusters = clusters
         self.store = store
+        # Injectable clock (ISO-8601 UTC string) so tests can cross the
+        # observation-window deadline deterministically.
+        self._clock = clock or now_iso
         self._lock = threading.RLock()
+
+    def now(self) -> str:
+        return self._clock()
 
     # ------------------------------------------------------------ plan basics
     def create_plan(self, spec: dict) -> dict:
@@ -70,9 +82,18 @@ class MigrationController:
             tables = sorted({t for t in spec["tables"] if isinstance(t, str) and t})
             if not tables:
                 raise MigrationError(BAD_REQUEST, "tables must be a non-empty list")
+            observation_seconds = spec.get(
+                "observation_seconds", DEFAULT_OBSERVATION_SECONDS)
+            if not isinstance(observation_seconds, int) \
+                    or isinstance(observation_seconds, bool) \
+                    or observation_seconds <= 0:
+                raise MigrationError(
+                    BAD_REQUEST,
+                    "observation_seconds must be a positive integer")
             spec = dict(spec, tables=tables,
                         consumer_group=spec.get("consumer_group")
-                        or f"grp_{spec['source_slot']}")
+                        or f"grp_{spec['source_slot']}",
+                        observation_seconds=observation_seconds)
             plan = self.store.create_plan(spec)
             self.store.record_event(plan.plan_id, "PLAN_CREATED",
                                     {"spec": plan.to_dict()})
@@ -288,6 +309,10 @@ class MigrationController:
                 final_digest = digest_tables(final_src)
 
                 group = self.store.get_group(plan.consumer_group)
+                # The takeover cursor: the new side's confirmed cursor at the
+                # moment service starts — the remapped old watermark.
+                takeover_q = self.store.floor_map(
+                    plan.plan_id, plan.attempt, group["watermark"])
                 snapshot = (self.store.get_snapshot(plan.snapshot_id)
                             if plan.snapshot_id else None)
                 manifest_digest = (digest_tables(snapshot["manifest"])
@@ -308,11 +333,14 @@ class MigrationController:
                         cutover_lsn=cutover_lsn, final_digest=final_digest,
                         handoff=handoff, timeline_digest=timeline_digest)
 
+                cutover_at = self.now()
                 proof = self.store.execute_cutover(
                     plan_id=plan.plan_id, attempt=plan.attempt,
                     group_id=group["group_id"], expected_epoch=group["epoch"],
                     new_cluster=plan.target_cluster, new_slot=plan.target_slot,
-                    cutover_lsn=cutover_lsn, build_proof_fn=build)
+                    cutover_lsn=cutover_lsn,
+                    target_confirmed_lsn=takeover_q,
+                    at_iso=cutover_at, build_proof_fn=build)
                 switched = True
             finally:
                 if not switched:
@@ -326,10 +354,16 @@ class MigrationController:
             target.update_slot_confirmed(
                 plan.target_slot,
                 proof["handoff"]["new"]["watermark_target_lsn"])
+            deadline = iso_add_seconds(cutover_at, plan.observation_seconds)
             self.store.record_event(plan_id, "CUTOVER_EXECUTED", {
                 "cutover_lsn": cutover_lsn, "final_digest": final_digest,
                 "proof_id": proof["proof_id"],
-                "handoff": proof["handoff"]})
+                "handoff": proof["handoff"],
+                "observation_seconds": plan.observation_seconds,
+                "observation_deadline": deadline,
+                "takeover_cursor": {
+                    **proof["handoff"]["new"], "confirmed_lsn": takeover_q},
+                "revocable_until": deadline})
             return proof
 
     # -------------------------------------------------------------- lifecycle
@@ -372,6 +406,135 @@ class MigrationController:
             source.unfence_tables(plan.tables, f"plan:{plan.plan_id}:{plan.attempt}")
             self.store.record_event(plan_id, "SOURCE_RELEASED", {})
             return {"plan_id": plan_id, "source_released": True}
+
+    # -------------------------------------------------------------- revocation
+    def observation(self, plan_id: str) -> dict:
+        with self._lock:
+            plan = self.store.get_plan(plan_id)
+            status = observation_status(self.store, self.clusters, plan,
+                                        now=self.now())
+            if status is None:
+                raise MigrationError(
+                    INVALID_STATE,
+                    f"plan {plan_id} is {plan.state}; no handover observation "
+                    f"window exists yet", http_status=409)
+            return status
+
+    def revoke_handoff(self, plan_id: str) -> dict:
+        """Revoke a successful handover during the observation window.
+
+        Allowed only while ALL of:
+          * the observation window is still open;
+          * the takeover side has not confirmed any new record (group
+            watermark and target-slot cursor unchanged since cutover);
+          * the original service is still protected (source tables fenced).
+
+        The reversal itself is ONE store transaction: ownership returns to
+        the original slot with its retained cursor, the fencing epoch is
+        bumped again, the revocation credential is persisted, the plan is
+        REVOKED. Afterwards the cluster-level fences are adjusted: the
+        original slot is reactivated (cursor restored), the takeover slot is
+        retired and the source write fence is lifted — the original service
+        resumes exactly where it stopped.
+
+        Repeated revoke requests return the existing credential. A rejection
+        never mutates any runtime state.
+        """
+        with self._lock:
+            plan = self.store.get_plan(plan_id)
+
+            # Idempotency: a repeated revoke returns the existing credential
+            # verbatim — the same request always yields the same result.
+            if plan.state == "REVOKED":
+                row = self.store.get_revocation_for_plan(plan_id)
+                if row is None:
+                    raise MigrationError(
+                        INVALID_STATE, "plan revoked but credential missing",
+                        http_status=409)
+                return row["proof"]
+
+            if plan.state != "COMPLETED":
+                raise MigrationError(
+                    INVALID_STATE,
+                    f"plan {plan_id} is {plan.state}; revoke requires a COMPLETED "
+                    f"handoff inside its observation window",
+                    {"current": plan.state}, http_status=409)
+
+            source = self.clusters[plan.source_cluster]
+            target = self.clusters[plan.target_cluster]
+            status = observation_status(self.store, self.clusters, plan,
+                                        now=self.now())
+            # Refuse with a specific reason; nothing is changed.
+            for code in (TAKEOVER_PROGRESSED, SOURCE_NOT_PROTECTED,
+                         OBSERVATION_EXPIRED):
+                if any(b["code"] == code for b in status["blocking_conditions"]):
+                    messages = {
+                        TAKEOVER_PROGRESSED: (
+                            "the takeover side has already confirmed new "
+                            "records; the handoff cannot be revoked"),
+                        SOURCE_NOT_PROTECTED: (
+                            "the original service is no longer protected "
+                            "(source write fence released); cannot revoke"),
+                        OBSERVATION_EXPIRED: (
+                            f"the {plan.observation_seconds}s observation "
+                            f"window ended at {status['deadline']}"),
+                    }
+                    raise MigrationError(
+                        code, messages[code],
+                        {"blocking_conditions": status["blocking_conditions"],
+                         "deadline": status["deadline"],
+                         "remaining_seconds": status["remaining_seconds"]},
+                        http_status=409)
+
+            cutover_row = self.store.get_proof(plan.proof_id)
+            cutover_proof = cutover_row["proof"]
+            group = self.store.get_group(plan.consumer_group)
+            takeover_epoch = group["epoch"]
+            takeover_watermark = group["watermark"]
+            events = self.store.get_events(plan_id)
+            timeline_digest = sha256_hex(canonical_json(
+                [(e["id"], e["ts"], e["kind"]) for e in events]))
+            restored_cursor = cutover_proof["handoff"]["mapping_anchor"]
+
+            token = f"plan:{plan.plan_id}:{plan.attempt}"
+            slots_before = {
+                "source": source.get_slot(plan.source_slot),
+                "target": target.get_slot(plan.target_slot),
+            }
+
+            def build_credential(handoff_back):
+                return proof_mod.build_revocation_credential(
+                    plan=plan, cutover_proof=cutover_proof,
+                    handoff_back=handoff_back, observation=status,
+                    source_protected=True, source_fence_token=token,
+                    slots=slots_before, timeline_digest=timeline_digest)
+
+            credential = self.store.execute_revocation(
+                plan_id=plan_id, group_id=plan.consumer_group,
+                takeover_epoch=takeover_epoch,
+                takeover_watermark=takeover_watermark,
+                at_iso=self.now(),
+                build_revocation_fn=build_credential)
+
+            # Cluster-level effects follow the committed transaction.
+            restored_lsn = restored_cursor["source_lsn"]
+            source.activate_slot(plan.source_slot, restored_lsn)
+            target.retire_slot(plan.target_slot)
+            source.unfence_tables(plan.tables, token)
+
+            self.store.record_event(plan_id, "HANDOVER_REVOKED", {
+                "revocation_id": credential["revocation_id"],
+                "revocation_hash": credential["revocation_hash"],
+                "cutover_proof_id": cutover_proof["proof_id"],
+                "restored": {"cluster": plan.source_cluster,
+                             "slot": plan.source_slot,
+                             "epoch": takeover_epoch + 1,
+                             "watermark_source_lsn": restored_lsn},
+                "retained_target_cursor_lsn":
+                    restored_cursor["target_lsn"],
+                "elapsed_seconds": status["elapsed_seconds"],
+                "deadline": status["deadline"]})
+            return credential
 
     # --------------------------------------------------------------- consumers
     def commit(self, group_id: str, cluster: str, slot: str, lsn: int,
@@ -422,7 +585,8 @@ class MigrationController:
     def reconcile(self, plan_id: str) -> dict:
         from .reconcile import build_report
         with self._lock:
-            return build_report(self.store, self.clusters, plan_id)
+            return build_report(self.store, self.clusters, plan_id,
+                                now=self.now())
 
     def get_proof(self, plan_id: str) -> dict:
         with self._lock:
@@ -432,7 +596,18 @@ class MigrationController:
                                      http_status=404)
             return row["proof"]
 
+    def get_revocation(self, plan_id: str) -> dict:
+        with self._lock:
+            row = self.store.get_revocation_for_plan(plan_id)
+            if row is None:
+                raise MigrationError(NOT_FOUND,
+                                     "no revocation credential for this plan",
+                                     http_status=404)
+            return row["proof"]
+
     def verify_proof(self, proof: dict) -> dict:
+        if proof.get("kind") == "REVOCATION":
+            return proof_mod.verify_revocation(proof, self.store)
         return proof_mod.verify_proof(proof, self.store)
 
     # ----------------------------------------------------------------- helpers

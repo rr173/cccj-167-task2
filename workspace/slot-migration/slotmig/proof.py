@@ -49,6 +49,142 @@ def build_proof(*, plan, snapshot: dict | None, manifest_digest: str | None,
     return proof
 
 
+def build_revocation_credential(*, plan, cutover_proof: dict,
+                                handoff_back: dict, observation: dict,
+                                source_protected: bool, source_fence_token: str | None,
+                                slots: dict, timeline_digest: str) -> dict:
+    """The tamper-evident credential produced when a cutover is revoked
+    inside its observation window. It binds together:
+
+    * the original cutover (id + hash + mapping anchor) being undone;
+    * the eligibility snapshot at revocation time (window open, no takeover
+      confirmation, source still protected);
+    * the ownership restoration with the fencing epoch bump;
+    * the retained cursor (source LSN preserved, target cursor recorded).
+    """
+    credential = {
+        "kind": "REVOCATION",
+        "revocation_id": new_id("revocation"),
+        "plan_id": plan.plan_id,
+        "attempt": plan.attempt,
+        "generated_at": now_iso(),
+        "cutover_ref": {
+            "proof_id": cutover_proof["proof_id"],
+            "proof_hash": cutover_proof["proof_hash"],
+            "cutover_at": plan.cutover_at,
+            "cutover_lsn": plan.cutover_lsn,
+        },
+        "observation": {
+            "window_seconds": plan.observation_seconds,
+            "deadline": observation["deadline"],
+            "elapsed_seconds": observation["elapsed_seconds"],
+            "within_window": observation["status"] != "expired",
+        },
+        "handoff_back": handoff_back,
+        "eligibility": {
+            "takeover_confirmed_new_records": False,
+            "takeover_cursor": plan.takeover_cursor,
+            "source_still_protected": source_protected,
+            "source_fence_token": source_fence_token,
+        },
+        "slots": slots,
+        "timeline_digest": timeline_digest,
+    }
+    credential["revocation_hash"] = sha256_hex(canonical_json(credential))
+    return credential
+
+
+def verify_revocation(credential: dict, store=None) -> dict:
+    """Independent verification of a handover-revocation credential.
+    Returns {"valid": bool, "checks": [...]}. Never raises."""
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    try:
+        body = {k: v for k, v in credential.items() if k != "revocation_hash"}
+        recomputed = sha256_hex(canonical_json(body))
+        check("hash_integrity", recomputed == credential.get("revocation_hash"),
+              f"recomputed={recomputed[:16]}…")
+    except Exception as exc:
+        check("hash_integrity", False, str(exc))
+        return {"valid": False, "checks": checks}
+
+    check("kind", credential.get("kind") == "REVOCATION",
+          str(credential.get("kind")))
+
+    hb = credential.get("handoff_back", {})
+    frm, restored = hb.get("from", {}), hb.get("restored", {})
+    retained = hb.get("retained_cursor", {})
+    check("epoch_step",
+          restored.get("epoch") == frm.get("epoch", 0) + 1,
+          f"{frm.get('epoch')} → {restored.get('epoch')}")
+
+    plan_spec_cutover = credential.get("cutover_ref", {})
+    check("cursor_retained",
+          retained.get("source_lsn") == restored.get("watermark_source_lsn")
+          and retained.get("target_lsn") == frm.get("watermark_target_lsn"),
+          f"source@{retained.get('source_lsn')} / "
+          f"target@{retained.get('target_lsn')}")
+    check("cutover_ref_present",
+          bool(plan_spec_cutover.get("proof_id"))
+          and bool(plan_spec_cutover.get("proof_hash")))
+
+    obs = credential.get("observation", {})
+    elig = credential.get("eligibility", {})
+    check("within_observation_window",
+          obs.get("within_window") is True,
+          f"deadline={obs.get('deadline')}")
+    check("no_takeover_confirmation",
+          elig.get("takeover_confirmed_new_records") is False)
+    check("source_protected",
+          elig.get("source_still_protected") is True)
+
+    if store is not None:
+        try:
+            plan = store.get_plan(credential.get("plan_id", ""))
+            check("plan_revoked", plan.state == "REVOKED", plan.state)
+            check("revocation_link",
+                  plan.revocation_id == credential.get("revocation_id"))
+        except Exception as exc:
+            check("plan_revoked", False, str(exc))
+        try:
+            group = store.get_group(hb.get("group", ""))
+            check("group_restored",
+                  group["epoch"] == restored.get("epoch")
+                  and group["cluster"] == restored.get("cluster")
+                  and group["slot"] == restored.get("slot")
+                  and group["watermark"] == restored.get("watermark_source_lsn"),
+                  f"group now on {group['cluster']}/{group['slot']} "
+                  f"epoch={group['epoch']} watermark={group['watermark']}")
+        except Exception as exc:
+            check("group_restored", False, str(exc))
+        try:
+            stored = store.get_proof(credential.get("revocation_id", ""))
+            check("stored_hash_match",
+                  stored is not None
+                  and stored["proof_hash"] == credential.get("revocation_hash"))
+        except Exception as exc:
+            check("stored_hash_match", False, str(exc))
+        try:
+            cutover = store.get_proof(
+                plan_spec_cutover.get("proof_id", ""))
+            check("cutover_proof_hash_match",
+                  cutover is not None
+                  and cutover["proof_hash"] == plan_spec_cutover.get("proof_hash"))
+            if cutover is not None:
+                anchor = cutover["proof"]["handoff"]["mapping_anchor"]
+                check("retained_cursor_matches_cutover",
+                      anchor.get("source_lsn") == retained.get("source_lsn")
+                      and anchor.get("target_lsn") == retained.get("target_lsn"),
+                      f"anchor={anchor}")
+        except Exception as exc:
+            check("cutover_proof_hash_match", False, str(exc))
+
+    return {"valid": all(c["ok"] for c in checks), "checks": checks}
+
+
 def verify_proof(proof: dict, store=None) -> dict:
     """Returns {"valid": bool, "checks": [...]}. Never raises."""
     checks = []
